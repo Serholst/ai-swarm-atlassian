@@ -1,0 +1,138 @@
+# SDLC Workflow Configuration
+# Based on: SDLC & Workflows Rules (ACTIVE, MANDATORY)
+
+confluence:
+  # Space structure from user's template
+  space_home_title: "🌌 AI Engineering Hub"
+  sdlc_rules_page_title: "SDLC & Workflows Rules"
+  product_registry_title: "Product Registry"
+
+  # SSOT Doctrine
+  ssot_role: "State"  # Architecture, Contracts, Logic
+
+  # Project Passport structure
+  project_passport_required_fields:
+    - "Identity & Ownership"
+    - "Technology Stack"
+    - "Repositories"
+    - "Environments"
+
+  logical_architecture_required_fields:
+    - "Component Diagram"
+    - "Data Flow"
+    - "Contracts & Interfaces"
+    - "Constraints"
+
+jira:
+  # Workflow Status Map (exact names, case-sensitive)
+  statuses:
+    backlog: "Backlog"
+    ai_to_do: "AI-TO-DO"
+    analysis: "Analysis"
+    human_plan_review: "Human Plan Review"
+    ready_for_dev: "Ready for Dev"
+    in_progress: "In Progress"
+    review: "Review"
+    deployment: "Deployment"
+    done: "Done"
+
+  # Issue Types
+  issue_types:
+    feature: "Feature"  # Parent
+    story: "Story"      # Child
+    task: "Task"        # Blocking
+
+  # Blocking Task Naming
+  blocking_tasks:
+    architecture_review: "[REVIEW] Approve Architecture (HUMAN)"
+    code_review_pattern: "[REVIEW] Devementation (Iter {iteration})"
+
+github:
+  ssot_role: "Devementation"  # Execution
+  branch_pattern: "feature/{key}-{slug}"
+  pr_title_pattern: "{key}: {feature_title}"
+
+# Naming Conventions
+naming:
+  # Layer Taxonomy ([LAYER])
+  layers:
+    - "BE"      # Backend, API, Microservices, Workers
+    - "FE"      # Frontend, UI/UX implementation
+    - "INFRA"   # Terraform, K8s, CI/CD pipelines
+    - "DB"      # Migrations, SQL, Schema changes
+    - "QA"      # Tests (E2E, Integration), Automation
+    - "DOCS"    # Technical writers tasks
+    - "GEN"     # General (fallback)
+
+  # Patterns
+  feature_title: "[{project_name}] {description}"
+  story_title: "[{layer}] {action}"
+  review_task: "[REVIEW] {phase_name} (HUMAN)"
+  draft_comment_header: "### DRAFT: {issue_key}_{slug}_{artifact_type}.md"
+
+# Operational Mode
+operational:
+  # MVP Constraint: Serial Processing
+  max_concurrent_features: 1
+  enforcement: "MANDATORY"
+
+  # Spec-First: No code before Architecture Gate
+  spec_first: true
+
+# Quality Gates
+gates:
+  definition_of_ready:
+    - "Clear Goal: Description is unambiguous"
+    - "Decomposition Clarity: Technical steps understood"
+    - "Resources Located: Confluence pages accessible"
+    - "Resources Located: GitHub repo accessible"
+
+  architecture_gate:
+    - "Plan fixed in Jira Comment"
+    - "[REVIEW] Approve Architecture marked as Done"
+
+  definition_of_done:
+    - "SSOT: Confluence matches implementation"
+    - "Code: PR merged to main"
+    - "Quality: CI Pipeline passed"
+    - "Clean-up: All child Stories closed"
+
+# Error Handling & Logging
+error_handling:
+  # Type A: Deterministic / Logic Errors (Internal)
+  type_a:
+    max_retries: 3
+    action: "self_correction"
+
+  # Type B: Environmental / Access Errors (External)
+  type_b:
+    action: "escalation"
+    blocker_prefix: "[BLOCKER]"
+
+  # Chain of Thoughts logging
+  cot_required: true
+  cot_panel_title: "Executor Rationale"
+
+# Strict Output Formats (Anti-Hallucination)
+output:
+  # Format Locking
+  default_format: "markdown"
+  allowed_formats: ["markdown"]
+
+  # No Implicit Assumptions
+  data_missing_marker: "[DATA MISSING]"
+  not_defined_marker: "[NOT DEFINED]"
+
+  # Prohibition: Don't delete existing Confluence content
+  confluence_delete_prohibited: true
+  confluence_allowed_operations: ["append", "update"]
+
+# Agent Configuration
+agent:
+  model: "claude-sonnet-4-5-20250929"
+  temperature: 0.2
+  max_tokens: 8192
+
+  # Validation
+  min_confidence: 0.7
+  require_citations: true

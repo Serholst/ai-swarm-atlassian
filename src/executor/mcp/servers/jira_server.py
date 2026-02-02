@@ -16,7 +16,9 @@ MCP Tools provided:
 """
 
 import os
+import re
 import logging
+import time
 from typing import Any, Sequence
 import requests
 from requests.auth import HTTPBasicAuth
@@ -27,28 +29,273 @@ from mcp.server import Server
 from mcp.types import Tool, TextContent
 from mcp import stdio_server
 
-# Local imports
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
-
-from executor.models.jira_models import (
-    JiraIssue,
-    JiraProject,
-    JiraStatus,
-    JiraComment,
-    JiraUser,
-    JiraIssueType,
-)
-
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("jira_mcp_server")
 
 
+class RateLimiter:
+    """Simple token bucket rate limiter."""
+
+    def __init__(self, requests_per_second: float = 10.0, burst_size: int = 20):
+        self.rps = requests_per_second
+        self.burst_size = burst_size
+        self._tokens = float(burst_size)
+        self._last_update = time.monotonic()
+
+    def acquire(self) -> None:
+        """Acquire a token, blocking if necessary."""
+        now = time.monotonic()
+        elapsed = now - self._last_update
+        self._tokens = min(self.burst_size, self._tokens + elapsed * self.rps)
+        self._last_update = now
+
+        if self._tokens < 1.0:
+            wait_time = (1.0 - self._tokens) / self.rps
+            logger.debug(f"Rate limit: waiting {wait_time:.2f}s")
+            time.sleep(wait_time)
+            self._tokens = 0.0
+        else:
+            self._tokens -= 1.0
+
+
+class MarkdownToADF:
+    """Convert Markdown to Atlassian Document Format (ADF)."""
+
+    @classmethod
+    def convert(cls, markdown: str) -> dict:
+        """
+        Convert Markdown to ADF.
+
+        Supports:
+        - Paragraphs
+        - Headers (h1-h6)
+        - Bold, italic, strikethrough
+        - Code blocks and inline code
+        - Bullet and numbered lists
+        - Links
+        - Blockquotes
+        """
+        if not markdown or not markdown.strip():
+            return {"type": "doc", "version": 1, "content": []}
+
+        lines = markdown.split("\n")
+        content = []
+        i = 0
+
+        while i < len(lines):
+            line = lines[i]
+
+            # Code block
+            if line.startswith("```"):
+                code_lines = []
+                language = line[3:].strip() or None
+                i += 1
+                while i < len(lines) and not lines[i].startswith("```"):
+                    code_lines.append(lines[i])
+                    i += 1
+                content.append(cls._code_block("\n".join(code_lines), language))
+                i += 1
+                continue
+
+            # Header
+            header_match = re.match(r"^(#{1,6})\s+(.+)$", line)
+            if header_match:
+                level = len(header_match.group(1))
+                text = header_match.group(2)
+                content.append(cls._heading(text, level))
+                i += 1
+                continue
+
+            # Blockquote
+            if line.startswith(">"):
+                quote_lines = []
+                while i < len(lines) and lines[i].startswith(">"):
+                    quote_lines.append(lines[i][1:].strip())
+                    i += 1
+                content.append(cls._blockquote("\n".join(quote_lines)))
+                continue
+
+            # Bullet list
+            if re.match(r"^[-*]\s+", line):
+                items = []
+                while i < len(lines) and re.match(r"^[-*]\s+", lines[i]):
+                    items.append(re.sub(r"^[-*]\s+", "", lines[i]))
+                    i += 1
+                content.append(cls._bullet_list(items))
+                continue
+
+            # Numbered list
+            if re.match(r"^\d+\.\s+", line):
+                items = []
+                while i < len(lines) and re.match(r"^\d+\.\s+", lines[i]):
+                    items.append(re.sub(r"^\d+\.\s+", "", lines[i]))
+                    i += 1
+                content.append(cls._ordered_list(items))
+                continue
+
+            # Empty line (skip)
+            if not line.strip():
+                i += 1
+                continue
+
+            # Regular paragraph
+            para_lines = [line]
+            i += 1
+            while i < len(lines) and lines[i].strip() and not cls._is_special_line(lines[i]):
+                para_lines.append(lines[i])
+                i += 1
+            content.append(cls._paragraph(" ".join(para_lines)))
+
+        return {"type": "doc", "version": 1, "content": content}
+
+    @classmethod
+    def _is_special_line(cls, line: str) -> bool:
+        """Check if line starts a special block."""
+        return (
+            line.startswith("```")
+            or line.startswith("#")
+            or line.startswith(">")
+            or re.match(r"^[-*]\s+", line)
+            or re.match(r"^\d+\.\s+", line)
+        )
+
+    @classmethod
+    def _paragraph(cls, text: str) -> dict:
+        """Create paragraph node with inline formatting."""
+        return {"type": "paragraph", "content": cls._parse_inline(text)}
+
+    @classmethod
+    def _heading(cls, text: str, level: int) -> dict:
+        """Create heading node."""
+        return {
+            "type": "heading",
+            "attrs": {"level": level},
+            "content": cls._parse_inline(text),
+        }
+
+    @classmethod
+    def _code_block(cls, code: str, language: str | None = None) -> dict:
+        """Create code block node."""
+        node = {
+            "type": "codeBlock",
+            "content": [{"type": "text", "text": code}],
+        }
+        if language:
+            node["attrs"] = {"language": language}
+        return node
+
+    @classmethod
+    def _blockquote(cls, text: str) -> dict:
+        """Create blockquote node."""
+        return {
+            "type": "blockquote",
+            "content": [cls._paragraph(text)],
+        }
+
+    @classmethod
+    def _bullet_list(cls, items: list[str]) -> dict:
+        """Create bullet list node."""
+        return {
+            "type": "bulletList",
+            "content": [
+                {"type": "listItem", "content": [cls._paragraph(item)]}
+                for item in items
+            ],
+        }
+
+    @classmethod
+    def _ordered_list(cls, items: list[str]) -> dict:
+        """Create ordered list node."""
+        return {
+            "type": "orderedList",
+            "content": [
+                {"type": "listItem", "content": [cls._paragraph(item)]}
+                for item in items
+            ],
+        }
+
+    @classmethod
+    def _parse_inline(cls, text: str) -> list[dict]:
+        """Parse inline formatting (bold, italic, code, links)."""
+        if not text:
+            return [{"type": "text", "text": ""}]
+
+        result = []
+        remaining = text
+
+        while remaining:
+            # Link: [text](url)
+            link_match = re.match(r"\[([^\]]+)\]\(([^)]+)\)", remaining)
+            if link_match:
+                result.append({
+                    "type": "text",
+                    "text": link_match.group(1),
+                    "marks": [{"type": "link", "attrs": {"href": link_match.group(2)}}],
+                })
+                remaining = remaining[link_match.end():]
+                continue
+
+            # Inline code: `code`
+            code_match = re.match(r"`([^`]+)`", remaining)
+            if code_match:
+                result.append({
+                    "type": "text",
+                    "text": code_match.group(1),
+                    "marks": [{"type": "code"}],
+                })
+                remaining = remaining[code_match.end():]
+                continue
+
+            # Bold: **text** or __text__
+            bold_match = re.match(r"\*\*([^*]+)\*\*|__([^_]+)__", remaining)
+            if bold_match:
+                result.append({
+                    "type": "text",
+                    "text": bold_match.group(1) or bold_match.group(2),
+                    "marks": [{"type": "strong"}],
+                })
+                remaining = remaining[bold_match.end():]
+                continue
+
+            # Italic: *text* or _text_
+            italic_match = re.match(r"\*([^*]+)\*|_([^_]+)_", remaining)
+            if italic_match:
+                result.append({
+                    "type": "text",
+                    "text": italic_match.group(1) or italic_match.group(2),
+                    "marks": [{"type": "em"}],
+                })
+                remaining = remaining[italic_match.end():]
+                continue
+
+            # Strikethrough: ~~text~~
+            strike_match = re.match(r"~~([^~]+)~~", remaining)
+            if strike_match:
+                result.append({
+                    "type": "text",
+                    "text": strike_match.group(1),
+                    "marks": [{"type": "strike"}],
+                })
+                remaining = remaining[strike_match.end():]
+                continue
+
+            # Plain text until next special char
+            plain_match = re.match(r"[^[`*_~]+", remaining)
+            if plain_match:
+                result.append({"type": "text", "text": plain_match.group()})
+                remaining = remaining[plain_match.end():]
+                continue
+
+            # Single special char (no match)
+            result.append({"type": "text", "text": remaining[0]})
+            remaining = remaining[1:]
+
+        return result if result else [{"type": "text", "text": text}]
+
+
 class JiraAPIClient:
-    """Jira REST API client with cleaning."""
+    """Jira REST API client with cleaning and rate limiting."""
 
     def __init__(self, base_url: str, email: str, api_token: str):
         """
@@ -63,68 +310,73 @@ class JiraAPIClient:
         self.auth = HTTPBasicAuth(email, api_token)
         self.session = requests.Session()
         self.session.auth = self.auth
-        self.session.headers.update({"Accept": "application/json", "Content-Type": "application/json"})
+        self.session.headers.update({
+            "Accept": "application/json",
+            "Content-Type": "application/json"
+        })
+        self._rate_limiter = RateLimiter(requests_per_second=10.0, burst_size=20)
+
+    def _request(self, method: str, url: str, **kwargs) -> requests.Response:
+        """Make rate-limited request with retry."""
+        max_retries = 3
+        base_delay = 1.0
+
+        for attempt in range(max_retries + 1):
+            self._rate_limiter.acquire()
+
+            try:
+                response = self.session.request(method, url, **kwargs)
+
+                if response.status_code == 429:
+                    if attempt < max_retries:
+                        retry_after = int(response.headers.get("Retry-After", base_delay * (2 ** attempt)))
+                        logger.warning(f"Rate limited (429), retrying in {retry_after}s")
+                        time.sleep(retry_after)
+                        continue
+                    response.raise_for_status()
+
+                response.raise_for_status()
+                return response
+
+            except requests.exceptions.RequestException as e:
+                if attempt < max_retries and getattr(getattr(e, 'response', None), 'status_code', None) in (429, 503):
+                    delay = base_delay * (2 ** attempt)
+                    logger.warning(f"Request failed, retrying in {delay}s: {e}")
+                    time.sleep(delay)
+                    continue
+                raise
+
+        raise RuntimeError("Max retries exceeded")
 
     def get_issue(self, issue_key: str) -> dict:
         """Get issue by key."""
         url = f"{self.base_url}/rest/api/3/issue/{issue_key}"
-        params = {
-            "expand": "renderedFields",
-            "fields": "*all",
-        }
-
-        response = self.session.get(url, params=params)
-        response.raise_for_status()
-
-        return response.json()
+        params = {"expand": "renderedFields", "fields": "*all"}
+        return self._request("GET", url, params=params).json()
 
     def search_issues(self, jql: str, max_results: int = 50) -> list[dict]:
         """Search issues with JQL."""
         url = f"{self.base_url}/rest/api/3/search"
-        payload = {
-            "jql": jql,
-            "maxResults": max_results,
-            "fields": "*all",
-        }
-
-        response = self.session.post(url, json=payload)
-        response.raise_for_status()
-
-        return response.json().get("issues", [])
+        payload = {"jql": jql, "maxResults": max_results, "fields": "*all"}
+        return self._request("POST", url, json=payload).json().get("issues", [])
 
     def get_comments(self, issue_key: str) -> list[dict]:
         """Get comments for an issue."""
         url = f"{self.base_url}/rest/api/3/issue/{issue_key}/comment"
-
-        response = self.session.get(url)
-        response.raise_for_status()
-
-        return response.json().get("comments", [])
+        return self._request("GET", url).json().get("comments", [])
 
     def add_comment(self, issue_key: str, body: str) -> dict:
         """Add a comment to an issue."""
         url = f"{self.base_url}/rest/api/3/issue/{issue_key}/comment"
-
-        # Convert Markdown to ADF (Atlassian Document Format)
-        adf_body = self._markdown_to_adf(body)
-
+        adf_body = MarkdownToADF.convert(body)
         payload = {"body": adf_body}
-
-        response = self.session.post(url, json=payload)
-        response.raise_for_status()
-
-        return response.json()
+        return self._request("POST", url, json=payload).json()
 
     def transition_issue(self, issue_key: str, transition_name: str) -> None:
         """Transition issue to a new status."""
-        # Get available transitions
         url = f"{self.base_url}/rest/api/3/issue/{issue_key}/transitions"
-        response = self.session.get(url)
-        response.raise_for_status()
+        transitions = self._request("GET", url).json().get("transitions", [])
 
-        transitions = response.json().get("transitions", [])
-
-        # Find transition ID
         transition_id = None
         for trans in transitions:
             if trans["name"].lower() == transition_name.lower():
@@ -134,10 +386,8 @@ class JiraAPIClient:
         if not transition_id:
             raise ValueError(f"Transition not found: {transition_name}")
 
-        # Execute transition
         payload = {"transition": {"id": transition_id}}
-        response = self.session.post(url, json=payload)
-        response.raise_for_status()
+        self._request("POST", url, json=payload)
 
     def create_issue(
         self,
@@ -157,37 +407,90 @@ class JiraAPIClient:
         }
 
         if description:
-            fields["description"] = self._markdown_to_adf(description)
+            fields["description"] = MarkdownToADF.convert(description)
 
         if parent_key:
             fields["parent"] = {"key": parent_key}
 
         payload = {"fields": fields}
+        return self._request("POST", url, json=payload).json()
 
-        response = self.session.post(url, json=payload)
-        response.raise_for_status()
 
-        return response.json()
+def extract_adf_text(adf: dict) -> str:
+    """Extract plain text from Atlassian Document Format."""
+    text_parts = []
 
-    @staticmethod
-    def _markdown_to_adf(markdown: str) -> dict:
-        """
-        Convert simple Markdown to ADF.
+    def traverse(node: dict) -> None:
+        if node.get("type") == "text":
+            text_parts.append(node.get("text", ""))
+        if "content" in node:
+            for child in node["content"]:
+                traverse(child)
 
-        Note: This is a simplified converter. For production, use a proper library.
-        """
-        # Simple ADF structure for plain text
-        paragraphs = markdown.split("\n\n")
-        content = []
+    traverse(adf)
+    return "".join(text_parts)
 
-        for para in paragraphs:
-            if para.strip():
-                content.append({
-                    "type": "paragraph",
-                    "content": [{"type": "text", "text": para.strip()}],
-                })
 
-        return {"type": "doc", "version": 1, "content": content}
+# Data models (inline to avoid sys.path issues)
+from pydantic import BaseModel, Field, field_validator
+from typing import Optional
+
+
+class JiraUser(BaseModel):
+    account_id: str
+    email: Optional[str] = None
+    display_name: str
+
+
+class JiraStatus(BaseModel):
+    id: str
+    name: str
+    status_category: str = Field(..., alias="statusCategory")
+
+    class Config:
+        populate_by_name = True
+
+
+class JiraIssueType(BaseModel):
+    id: str
+    name: str
+    hierarchical_level: int = Field(0)
+
+
+class JiraProject(BaseModel):
+    key: str
+    name: str
+    id: str
+
+
+class JiraIssue(BaseModel):
+    key: str
+    id: str
+    self_url: str = Field(..., alias="self")
+    project: JiraProject
+    issue_type: JiraIssueType = Field(..., alias="issuetype")
+    summary: str
+    description: Optional[str] = None
+    status: JiraStatus
+    assignee: Optional[JiraUser] = None
+    reporter: JiraUser
+    labels: list[str] = Field(default_factory=list)
+    created: datetime
+    updated: datetime
+    parent_key: Optional[str] = None
+    subtasks: list[str] = Field(default_factory=list)
+
+    class Config:
+        populate_by_name = True
+
+    @field_validator("description", mode="before")
+    @classmethod
+    def clean_description(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        if isinstance(v, dict):
+            return extract_adf_text(v)
+        return str(v).strip()
 
 
 # Initialize MCP Server
@@ -200,6 +503,7 @@ JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN", "")
 
 if not all([JIRA_URL, JIRA_EMAIL, JIRA_API_TOKEN]):
     logger.error("Missing required environment variables for Jira")
+    import sys
     sys.exit(1)
 
 jira_client = JiraAPIClient(JIRA_URL, JIRA_EMAIL, JIRA_API_TOKEN)
@@ -209,7 +513,6 @@ def _parse_jira_user(user_data: dict | None) -> JiraUser | None:
     """Parse Jira user data."""
     if not user_data:
         return None
-
     return JiraUser(
         account_id=user_data.get("accountId", ""),
         email=user_data.get("emailAddress"),
@@ -221,7 +524,6 @@ def _parse_jira_issue(issue_data: dict) -> JiraIssue:
     """Parse raw Jira issue data to cleaned JiraIssue model."""
     fields = issue_data.get("fields", {})
 
-    # Parse project
     project_data = fields.get("project", {})
     project = JiraProject(
         key=project_data.get("key", ""),
@@ -229,7 +531,6 @@ def _parse_jira_issue(issue_data: dict) -> JiraIssue:
         id=project_data.get("id", ""),
     )
 
-    # Parse issue type
     issuetype_data = fields.get("issuetype", {})
     issue_type = JiraIssueType(
         id=issuetype_data.get("id", ""),
@@ -237,7 +538,6 @@ def _parse_jira_issue(issue_data: dict) -> JiraIssue:
         hierarchical_level=issuetype_data.get("hierarchyLevel", 0),
     )
 
-    # Parse status
     status_data = fields.get("status", {})
     status = JiraStatus(
         id=status_data.get("id", ""),
@@ -245,18 +545,14 @@ def _parse_jira_issue(issue_data: dict) -> JiraIssue:
         statusCategory=status_data.get("statusCategory", {}).get("name", ""),
     )
 
-    # Parse users
     assignee = _parse_jira_user(fields.get("assignee"))
     reporter = _parse_jira_user(fields.get("reporter"))
 
-    # Get parent key
     parent_data = fields.get("parent")
     parent_key = parent_data.get("key") if parent_data else None
 
-    # Get subtasks
     subtasks = [subtask.get("key", "") for subtask in fields.get("subtasks", [])]
 
-    # Parse dates
     created = fields.get("created", datetime.now().isoformat())
     updated = fields.get("updated", datetime.now().isoformat())
 
@@ -267,7 +563,7 @@ def _parse_jira_issue(issue_data: dict) -> JiraIssue:
         project=project,
         issuetype=issue_type,
         summary=fields.get("summary", ""),
-        description=fields.get("description"),  # Will be cleaned by validator
+        description=fields.get("description"),
         status=status,
         assignee=assignee,
         reporter=reporter or JiraUser(account_id="unknown", display_name="Unknown"),
@@ -277,9 +573,6 @@ def _parse_jira_issue(issue_data: dict) -> JiraIssue:
         parent_key=parent_key,
         subtasks=subtasks,
     )
-
-
-# Define MCP Tools
 
 
 @app.list_tools()
@@ -292,10 +585,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "issue_key": {
-                        "type": "string",
-                        "description": "Issue key (e.g., AI-123)",
-                    },
+                    "issue_key": {"type": "string", "description": "Issue key (e.g., AI-123)"},
                 },
                 "required": ["issue_key"],
             },
@@ -306,15 +596,8 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "jql": {
-                        "type": "string",
-                        "description": "JQL query",
-                    },
-                    "max_results": {
-                        "type": "number",
-                        "description": "Max results (default 50)",
-                        "default": 50,
-                    },
+                    "jql": {"type": "string", "description": "JQL query"},
+                    "max_results": {"type": "number", "description": "Max results (default 50)", "default": 50},
                 },
                 "required": ["jql"],
             },
@@ -325,10 +608,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "issue_key": {
-                        "type": "string",
-                        "description": "Issue key",
-                    },
+                    "issue_key": {"type": "string", "description": "Issue key"},
                 },
                 "required": ["issue_key"],
             },
@@ -339,14 +619,8 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "issue_key": {
-                        "type": "string",
-                        "description": "Issue key",
-                    },
-                    "body": {
-                        "type": "string",
-                        "description": "Comment body (Markdown)",
-                    },
+                    "issue_key": {"type": "string", "description": "Issue key"},
+                    "body": {"type": "string", "description": "Comment body (Markdown)"},
                 },
                 "required": ["issue_key", "body"],
             },
@@ -357,14 +631,8 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "issue_key": {
-                        "type": "string",
-                        "description": "Issue key",
-                    },
-                    "transition_name": {
-                        "type": "string",
-                        "description": "Transition name (e.g., 'Analysis', 'In Progress')",
-                    },
+                    "issue_key": {"type": "string", "description": "Issue key"},
+                    "transition_name": {"type": "string", "description": "Transition name"},
                 },
                 "required": ["issue_key", "transition_name"],
             },
@@ -375,26 +643,11 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "project_key": {
-                        "type": "string",
-                        "description": "Project key",
-                    },
-                    "issue_type": {
-                        "type": "string",
-                        "description": "Issue type (Feature, Story, Task)",
-                    },
-                    "summary": {
-                        "type": "string",
-                        "description": "Issue summary/title",
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": "Issue description (Markdown)",
-                    },
-                    "parent_key": {
-                        "type": "string",
-                        "description": "Parent issue key (for Stories)",
-                    },
+                    "project_key": {"type": "string", "description": "Project key"},
+                    "issue_type": {"type": "string", "description": "Issue type (Feature, Story, Task)"},
+                    "summary": {"type": "string", "description": "Issue summary/title"},
+                    "description": {"type": "string", "description": "Issue description (Markdown)"},
+                    "parent_key": {"type": "string", "description": "Parent issue key (for Stories)"},
                 },
                 "required": ["project_key", "issue_type", "summary"],
             },
@@ -435,9 +688,8 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
         elif name == "jira_search_issues":
             jql = arguments["jql"]
             max_results = arguments.get("max_results", 50)
-
             issues_data = jira_client.search_issues(jql, max_results=max_results)
-            issues = [_parse_jira_issue(issue_data) for issue_data in issues_data]
+            issues = [_parse_jira_issue(d) for d in issues_data]
 
             output_lines = [f"Found {len(issues)} issues:\n"]
             for issue in issues:
@@ -445,7 +697,6 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                     f"- **{issue.key}**: {issue.summary}\n"
                     f"  Status: {issue.status.name}, Type: {issue.issue_type.name}"
                 )
-
             return [TextContent(type="text", text="\n".join(output_lines))]
 
         elif name == "jira_get_comments":
@@ -457,10 +708,7 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                 author = comment_data.get("author", {}).get("displayName", "Unknown")
                 created = comment_data.get("created", "")
                 body = comment_data.get("body", {})
-
-                # Extract text from ADF
-                body_text = JiraComment._extract_adf_text(body) if isinstance(body, dict) else str(body)
-
+                body_text = extract_adf_text(body) if isinstance(body, dict) else str(body)
                 output_lines.append(f"\n### {author} - {created}\n\n{body_text}\n")
 
             return [TextContent(type="text", text="\n".join(output_lines))]
@@ -468,14 +716,12 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
         elif name == "jira_add_comment":
             issue_key = arguments["issue_key"]
             body = arguments["body"]
-
             jira_client.add_comment(issue_key, body)
             return [TextContent(type="text", text=f"Comment added to {issue_key}")]
 
         elif name == "jira_transition_issue":
             issue_key = arguments["issue_key"]
             transition_name = arguments["transition_name"]
-
             jira_client.transition_issue(issue_key, transition_name)
             return [TextContent(type="text", text=f"Issue {issue_key} transitioned to {transition_name}")]
 
@@ -486,10 +732,7 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
             description = arguments.get("description", "")
             parent_key = arguments.get("parent_key")
 
-            result = jira_client.create_issue(
-                project_key, issue_type, summary, description, parent_key
-            )
-
+            result = jira_client.create_issue(project_key, issue_type, summary, description, parent_key)
             new_key = result.get("key", "")
             return [TextContent(type="text", text=f"Created issue: {new_key}")]
 
@@ -509,5 +752,4 @@ async def main():
 
 if __name__ == "__main__":
     import asyncio
-
     asyncio.run(main())

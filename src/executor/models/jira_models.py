@@ -113,6 +113,9 @@ class JiraIssue(BaseModel):
     # Custom fields (project-specific)
     custom_fields: dict[str, Any] = Field(default_factory=dict)
 
+    # Confluence folder name (from custom "Project" field - customfield_10072)
+    project_folder: str = Field("", description="Confluence folder name")
+
     class Config:
         """Pydantic config."""
         populate_by_name = True

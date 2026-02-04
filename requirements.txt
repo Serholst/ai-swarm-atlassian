@@ -18,6 +18,7 @@ pydantic-settings>=2.3.0
 
 # LLM
 anthropic>=0.34.0
+openai>=1.0.0  # DeepSeek uses OpenAI-compatible API
 
 # Utilities
 python-dotenv>=1.0.0

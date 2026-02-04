@@ -17,12 +17,25 @@ MCP Tools provided:
 
 import os
 import re
+import sys
 import logging
 import time
 from typing import Any, Sequence
 import requests
 from requests.auth import HTTPBasicAuth
 from datetime import datetime
+
+# Add package root to path for model imports
+# Need 4 levels up: servers -> mcp -> executor -> src
+_package_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+if _package_root not in sys.path:
+    sys.path.insert(0, _package_root)
+
+# Import models from canonical location
+from executor.models import JiraUser, JiraStatus, JiraIssueType, JiraProject, JiraIssue
+
+# Import shared rate limiter
+from executor.utils.rate_limiter import RateLimiter
 
 # MCP SDK imports
 from mcp.server import Server
@@ -32,31 +45,6 @@ from mcp import stdio_server
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("jira_mcp_server")
-
-
-class RateLimiter:
-    """Simple token bucket rate limiter."""
-
-    def __init__(self, requests_per_second: float = 10.0, burst_size: int = 20):
-        self.rps = requests_per_second
-        self.burst_size = burst_size
-        self._tokens = float(burst_size)
-        self._last_update = time.monotonic()
-
-    def acquire(self) -> None:
-        """Acquire a token, blocking if necessary."""
-        now = time.monotonic()
-        elapsed = now - self._last_update
-        self._tokens = min(self.burst_size, self._tokens + elapsed * self.rps)
-        self._last_update = now
-
-        if self._tokens < 1.0:
-            wait_time = (1.0 - self._tokens) / self.rps
-            logger.debug(f"Rate limit: waiting {wait_time:.2f}s")
-            time.sleep(wait_time)
-            self._tokens = 0.0
-        else:
-            self._tokens -= 1.0
 
 
 class MarkdownToADF:
@@ -320,9 +308,11 @@ class JiraAPIClient:
         """Make rate-limited request with retry."""
         max_retries = 3
         base_delay = 1.0
+        # Default timeout: 5s connect, 30s read
+        kwargs.setdefault("timeout", (5, 30))
 
         for attempt in range(max_retries + 1):
-            self._rate_limiter.acquire()
+            self._rate_limiter.acquire_sync()
 
             try:
                 response = self.session.request(method, url, **kwargs)
@@ -417,80 +407,62 @@ class JiraAPIClient:
 
 
 def extract_adf_text(adf: dict) -> str:
-    """Extract plain text from Atlassian Document Format."""
-    text_parts = []
+    """Extract plain text from Atlassian Document Format with basic formatting."""
+    result = []
 
-    def traverse(node: dict) -> None:
-        if node.get("type") == "text":
-            text_parts.append(node.get("text", ""))
-        if "content" in node:
-            for child in node["content"]:
-                traverse(child)
+    def traverse(node: dict, list_prefix: str = "") -> str:
+        node_type = node.get("type", "")
+        content = node.get("content", [])
 
-    traverse(adf)
-    return "".join(text_parts)
+        if node_type == "text":
+            return node.get("text", "")
 
+        if node_type == "hardBreak":
+            return "\n"
 
-# Data models (inline to avoid sys.path issues)
-from pydantic import BaseModel, Field, field_validator
-from typing import Optional
+        if node_type == "paragraph":
+            text = "".join(traverse(child) for child in content)
+            return text + "\n"
 
+        if node_type == "heading":
+            level = node.get("attrs", {}).get("level", 1)
+            text = "".join(traverse(child) for child in content)
+            return "#" * level + " " + text + "\n"
 
-class JiraUser(BaseModel):
-    account_id: str
-    email: Optional[str] = None
-    display_name: str
+        if node_type == "bulletList":
+            items = []
+            for child in content:
+                items.append(traverse(child, "- "))
+            return "".join(items)
 
+        if node_type == "orderedList":
+            items = []
+            for i, child in enumerate(content, 1):
+                items.append(traverse(child, f"{i}. "))
+            return "".join(items)
 
-class JiraStatus(BaseModel):
-    id: str
-    name: str
-    status_category: str = Field(..., alias="statusCategory")
+        if node_type == "listItem":
+            text = "".join(traverse(child) for child in content)
+            return list_prefix + text
 
-    class Config:
-        populate_by_name = True
+        if node_type == "codeBlock":
+            text = "".join(traverse(child) for child in content)
+            return f"```\n{text}```\n"
 
+        if node_type == "blockquote":
+            text = "".join(traverse(child) for child in content)
+            lines = text.strip().split("\n")
+            return "\n".join("> " + line for line in lines) + "\n"
 
-class JiraIssueType(BaseModel):
-    id: str
-    name: str
-    hierarchical_level: int = Field(0)
+        # Default: just traverse children
+        return "".join(traverse(child) for child in content)
 
-
-class JiraProject(BaseModel):
-    key: str
-    name: str
-    id: str
-
-
-class JiraIssue(BaseModel):
-    key: str
-    id: str
-    self_url: str = Field(..., alias="self")
-    project: JiraProject
-    issue_type: JiraIssueType = Field(..., alias="issuetype")
-    summary: str
-    description: Optional[str] = None
-    status: JiraStatus
-    assignee: Optional[JiraUser] = None
-    reporter: JiraUser
-    labels: list[str] = Field(default_factory=list)
-    created: datetime
-    updated: datetime
-    parent_key: Optional[str] = None
-    subtasks: list[str] = Field(default_factory=list)
-
-    class Config:
-        populate_by_name = True
-
-    @field_validator("description", mode="before")
-    @classmethod
-    def clean_description(cls, v: Any) -> Optional[str]:
-        if v is None:
-            return None
-        if isinstance(v, dict):
-            return extract_adf_text(v)
-        return str(v).strip()
+    if adf and isinstance(adf, dict):
+        result = traverse(adf)
+        # Clean up multiple blank lines
+        result = re.sub(r"\n{3,}", "\n\n", result)
+        return result.strip()
+    return ""
 
 
 # Initialize MCP Server
@@ -553,8 +525,30 @@ def _parse_jira_issue(issue_data: dict) -> JiraIssue:
 
     subtasks = [subtask.get("key", "") for subtask in fields.get("subtasks", [])]
 
-    created = fields.get("created", datetime.now().isoformat())
-    updated = fields.get("updated", datetime.now().isoformat())
+    created = fields.get("created")
+    updated = fields.get("updated")
+    if not created or not updated:
+        issue_key = issue_data.get("key", "unknown")
+        logger.warning(f"Issue {issue_key} missing timestamps: created={created}, updated={updated}")
+        raise ValueError(f"Issue {issue_key} missing required timestamp fields")
+
+    # Convert ADF description to plain text
+    description_adf = fields.get("description")
+    description_text = ""
+    if description_adf and isinstance(description_adf, dict):
+        description_text = extract_adf_text(description_adf)
+    elif description_adf:
+        description_text = str(description_adf)
+
+    # Extract custom "Project" field (Confluence folder name)
+    # customfield_10072 is a dropdown, customfield_10073 is text
+    project_folder = ""
+    cf_project_dropdown = fields.get("customfield_10072")
+    if cf_project_dropdown and isinstance(cf_project_dropdown, dict):
+        project_folder = cf_project_dropdown.get("value", "")
+    if not project_folder:
+        # Fallback to text field
+        project_folder = fields.get("customfield_10073", "") or ""
 
     return JiraIssue(
         key=issue_data["key"],
@@ -563,7 +557,7 @@ def _parse_jira_issue(issue_data: dict) -> JiraIssue:
         project=project,
         issuetype=issue_type,
         summary=fields.get("summary", ""),
-        description=fields.get("description"),
+        description=description_text,
         status=status,
         assignee=assignee,
         reporter=reporter or JiraUser(account_id="unknown", display_name="Unknown"),
@@ -572,6 +566,7 @@ def _parse_jira_issue(issue_data: dict) -> JiraIssue:
         updated=updated,
         parent_key=parent_key,
         subtasks=subtasks,
+        project_folder=project_folder,
     )
 
 
@@ -669,6 +664,7 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
 **Type:** {issue.issue_type.name}
 **Status:** {issue.status.name}
 **Project:** {issue.project.name} ({issue.project.key})
+**Project Folder:** {issue.project_folder or 'None'}
 **Assignee:** {issue.assignee.display_name if issue.assignee else 'Unassigned'}
 **Labels:** {', '.join(issue.labels) if issue.labels else 'None'}
 

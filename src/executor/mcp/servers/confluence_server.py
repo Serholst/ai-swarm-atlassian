@@ -15,11 +15,25 @@ MCP Tools provided:
 
 import os
 import re
+import sys
 import logging
 import time
+from datetime import datetime
 from typing import Any, Sequence
 import requests
 from requests.auth import HTTPBasicAuth
+
+# Add package root to path for model imports
+# Need 4 levels up: servers -> mcp -> executor -> src
+_package_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+if _package_root not in sys.path:
+    sys.path.insert(0, _package_root)
+
+# Import models from canonical location
+from executor.models import ConfluenceSpace, ConfluencePage
+
+# Import shared rate limiter
+from executor.utils.rate_limiter import RateLimiter
 
 # MCP SDK imports
 from mcp.server import Server
@@ -33,31 +47,6 @@ import html2text
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("confluence_mcp_server")
-
-
-class RateLimiter:
-    """Simple token bucket rate limiter."""
-
-    def __init__(self, requests_per_second: float = 10.0, burst_size: int = 20):
-        self.rps = requests_per_second
-        self.burst_size = burst_size
-        self._tokens = float(burst_size)
-        self._last_update = time.monotonic()
-
-    def acquire(self) -> None:
-        """Acquire a token, blocking if necessary."""
-        now = time.monotonic()
-        elapsed = now - self._last_update
-        self._tokens = min(self.burst_size, self._tokens + elapsed * self.rps)
-        self._last_update = now
-
-        if self._tokens < 1.0:
-            wait_time = (1.0 - self._tokens) / self.rps
-            logger.debug(f"Rate limit: waiting {wait_time:.2f}s")
-            time.sleep(wait_time)
-            self._tokens = 0.0
-        else:
-            self._tokens -= 1.0
 
 
 def clean_confluence_html(html_content: str) -> str:
@@ -151,9 +140,11 @@ class ConfluenceAPIClient:
         """Make rate-limited request with retry."""
         max_retries = 3
         base_delay = 1.0
+        # Default timeout: 5s connect, 30s read
+        kwargs.setdefault("timeout", (5, 30))
 
         for attempt in range(max_retries + 1):
-            self._rate_limiter.acquire()
+            self._rate_limiter.acquire_sync()
 
             try:
                 response = self.session.request(method, url, **kwargs)
@@ -206,44 +197,6 @@ class ConfluenceAPIClient:
         """Get space metadata."""
         url = f"{self.base_url}/rest/api/space/{space_key}"
         return self._request("GET", url).json()
-
-
-# Data models (inline to avoid sys.path issues)
-from pydantic import BaseModel, Field, field_validator
-from typing import Optional
-from datetime import datetime
-
-
-class ConfluenceSpace(BaseModel):
-    key: str
-    name: str
-    id: str
-
-
-class ConfluencePage(BaseModel):
-    id: str
-    title: str
-    space: ConfluenceSpace
-    status: str
-    body: str = Field(..., description="Cleaned Markdown content")
-    version: int
-    created_at: datetime = Field(..., alias="created")
-    updated_at: datetime = Field(..., alias="updated")
-    url: str
-    labels: list[str] = Field(default_factory=list)
-    parent_id: Optional[str] = None
-
-    class Config:
-        populate_by_name = True
-
-    @field_validator("body", mode="before")
-    @classmethod
-    def clean_body(cls, v: Any) -> str:
-        if isinstance(v, dict):
-            html_content = v.get("storage", {}).get("value", "")
-        else:
-            html_content = str(v)
-        return clean_confluence_html(html_content)
 
 
 # Initialize MCP Server

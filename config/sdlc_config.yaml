@@ -129,10 +129,15 @@ output:
 
 # Agent Configuration
 agent:
-  model: "claude-sonnet-4-5-20250929"
+  provider: "deepseek"
+  model: "deepseek-chat"  # or "deepseek-coder" for code tasks
+  api_base: "https://api.deepseek.com/v1"
   temperature: 0.2
   max_tokens: 8192
 
   # Validation
   min_confidence: 0.7
   require_citations: true
+
+  # Output settings
+  save_prompt: true  # Save prompt.md before LLM call

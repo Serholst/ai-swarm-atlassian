@@ -309,6 +309,12 @@ class MCPClientManager:
             "jira_transition_issue", {"issue_key": issue_key, "transition_name": transition_name}
         )
 
+    def jira_get_comments(self, issue_key: str) -> str:
+        """Get comments for a Jira issue."""
+        return self.clients["jira"].call_tool(
+            "jira_get_comments", {"issue_key": issue_key}
+        )
+
     def confluence_get_page(
         self, page_id: str | None = None, space_key: str | None = None, title: str | None = None
     ) -> str:

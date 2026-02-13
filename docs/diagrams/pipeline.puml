@@ -1,0 +1,163 @@
+@startuml AI-Swarm Pipeline Architecture
+!theme plain
+skinparam backgroundColor #FEFEFE
+skinparam defaultFontSize 12
+skinparam roundCorner 10
+skinparam shadowing false
+
+title AI-Swarm: 5-Stage SDLC Execution Pipeline
+
+' ============================================================
+' Actors
+' ============================================================
+actor "Developer" as dev
+entity "CLI\nexecute.py" as cli
+
+' ============================================================
+' Stage 1: Trigger
+' ============================================================
+package "Stage 1: Trigger" as s1 #E3F2FD {
+  component "Parse\nIssue Key" as parse
+  note right of parse
+    Input: PROJ-123 or URL
+    Output: Validated key
+  end note
+}
+
+' ============================================================
+' Stage 2: Jira Enrichment
+' ============================================================
+package "Stage 2: Jira Enrichment" as s2 #E8F5E9 {
+  component "Extract\nJira Context" as jira_extract
+  note right of jira_extract
+    - Summary & Description
+    - Issue Type & Status
+    - Labels & Components
+    - Custom Fields
+    - Comments
+  end note
+}
+
+' ============================================================
+' Stage 3: Knowledge Retrieval
+' ============================================================
+package "Stage 3: Knowledge Retrieval" as s3 #FFF3E0 {
+  package "3a: Confluence\n(Two-Stage Retrieval)" as s3a {
+    component "Phase 1:\nLocation\nResolution" as loc
+    component "Phase 2:\nMandatory\nDocuments" as mandatory
+    component "Phase 3:\nLLM Filter\n(DeepSeek)" as llm_filter
+  }
+  package "3b: GitHub\nContext" as s3b {
+    component "URL\nDiscovery" as gh_url
+    component "Repo\nStructure" as gh_struct
+    component "Confluence\nDeduplication" as dedup
+  }
+}
+
+' ============================================================
+' Stage 4: Aggregation
+' ============================================================
+package "Stage 4: Data Aggregation" as s4 #F3E5F5 {
+  component "Build\nExecutionContext" as aggregate
+  note right of aggregate
+    Unified context:
+    Jira + Confluence + GitHub
+  end note
+}
+
+' ============================================================
+' Stage 5: LLM Execution
+' ============================================================
+package "Stage 5: LLM Execution" as s5 #FFEBEE {
+  component "Generate\nWork Plan" as plan
+  component "DoR\nCheck" as dor
+  component "Post-Execution:\nDecomposition\n& Transition" as post
+}
+
+' ============================================================
+' MCP Layer
+' ============================================================
+package "MCP Integration Layer" as mcp #F5F5F5 {
+  component "Jira MCP\n(Custom)" as jira_mcp
+  component "Confluence MCP\n(Custom)" as conf_mcp
+  component "GitHub MCP\n(Official)" as gh_mcp
+}
+
+' ============================================================
+' External Systems
+' ============================================================
+cloud "Atlassian Cloud" as atlassian {
+  database "Jira" as jira_db
+  database "Confluence" as conf_db
+}
+cloud "GitHub" as github_cloud {
+  database "Repository" as gh_repo
+}
+cloud "DeepSeek API" as deepseek
+
+' ============================================================
+' Output
+' ============================================================
+collections "Output Files" as output {
+  file "context.md" as f1
+  file "selection.md" as f2
+  file "prompt.md" as f3
+  file "reasoning.md" as f4
+  file "plan.md" as f5
+}
+
+' ============================================================
+' Flow
+' ============================================================
+dev --> cli : python execute.py\n--task PROJ-123
+cli --> parse
+
+parse --> jira_extract
+
+jira_extract --> loc
+jira_extract --> gh_url
+
+loc --> mandatory
+mandatory --> llm_filter
+llm_filter ..> deepseek : Filter\ncandidates
+
+gh_url --> gh_struct
+gh_struct --> dedup
+
+mandatory --> aggregate
+llm_filter --> aggregate
+dedup --> aggregate
+
+aggregate --> plan
+plan ..> deepseek : Generate\nwork plan
+plan --> dor
+dor --> post
+
+post ..> jira_mcp : Transition +\nComment
+
+' MCP connections
+jira_extract ..> jira_mcp
+jira_mcp ..> jira_db
+
+loc ..> conf_mcp
+mandatory ..> conf_mcp
+conf_mcp ..> conf_db
+
+gh_url ..> gh_mcp
+gh_struct ..> gh_mcp
+gh_mcp ..> gh_repo
+
+plan --> output
+
+' ============================================================
+' Legend
+' ============================================================
+legend bottom right
+  |= Symbol |= Meaning |
+  | ──▶ | Data flow |
+  | ..▶ | API call |
+  | 3a | Confluence Two-Stage Retrieval |
+  | 3b | GitHub Context (with dedup) |
+end legend
+
+@enduml

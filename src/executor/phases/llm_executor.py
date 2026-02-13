@@ -3,13 +3,15 @@ LLM Executor - Stage 5 of the execution pipeline.
 
 Handles:
 - Prompt construction and saving
-- DeepSeek API call
+- DeepSeek API call with validation and retry
 - Response parsing and saving
 - Output file generation
+- Metrics collection
 """
 
 import os
 import re
+import time
 import logging
 from pathlib import Path
 from datetime import datetime
@@ -19,9 +21,43 @@ from typing import Optional
 from openai import OpenAI
 
 from ..models.execution_context import ExecutionContext
+from ..models.llm_metrics import LLMCallMetrics, ExecutionMetrics
 from ..prompts import SYSTEM_PROMPT, build_user_prompt
+from .validation import validate_work_plan, ValidationResult
 
 logger = logging.getLogger(__name__)
+
+# Retry prompt template for targeted Work Plan fixes
+RETRY_PROMPT_TEMPLATE = """Your previous Work Plan section had validation errors.
+
+## Errors Found:
+{errors}
+
+## Original Work Plan Section:
+{original_work_plan}
+
+## Instructions:
+Please regenerate ONLY the Work Plan section (### 4. Work Plan) with the following corrections:
+
+1. Each step MUST follow format: - [ ] **Step N:** [description]
+2. Each step MUST include **Layer:** [BE/FE/INFRA/DB/QA/DOCS/GEN]
+3. Each step MUST include **Files:** [expected files]
+4. Each step MUST include **Acceptance:** [verification criteria]
+
+Layer codes:
+- BE - Backend, API, Microservices
+- FE - Frontend, UI/UX
+- INFRA - Terraform, K8s, CI/CD
+- DB - Migrations, Schema changes
+- QA - Tests, Automation
+- DOCS - Documentation
+- GEN - General/Cross-cutting
+
+Return ONLY the corrected Work Plan section, starting with "### 4. Work Plan".
+"""
+
+# Constants
+WORK_PLAN_TRUNCATE_LIMIT = 3000  # Max chars to include in retry prompt
 
 
 @dataclass
@@ -41,7 +77,10 @@ class LLMResponse:
     # Metadata
     model: str = ""
     tokens_used: int = 0
+    tokens_in: int = 0  # prompt_tokens
+    tokens_out: int = 0  # completion_tokens
     finish_reason: str = ""
+    retry_failed: bool = False  # True if retry API call failed
 
 
 @dataclass
@@ -53,10 +92,14 @@ class ExecutionOutput:
     reasoning_file: Path
     plan_file: Path
     selection_file: Optional[Path] = None  # LLM document selection log
+    metrics_file: Optional[Path] = None  # LLM usage metrics
 
 
 class LLMExecutor:
     """Stage 5: LLM Execution with DeepSeek API."""
+
+    # Validation retry settings
+    MAX_RETRIES = 2  # Max 3 total attempts (1 initial + 2 retries)
 
     def __init__(
         self,
@@ -66,6 +109,7 @@ class LLMExecutor:
         temperature: float = 0.2,
         max_tokens: int = 8192,
         output_dir: str = "outputs",
+        max_retries: Optional[int] = None,
     ):
         """
         Initialize LLM Executor.
@@ -77,6 +121,7 @@ class LLMExecutor:
             temperature: Sampling temperature
             max_tokens: Maximum response tokens
             output_dir: Directory for output files
+            max_retries: Override default max retries for validation failures
         """
         self.api_key = api_key or os.getenv("DEEPSEEK_API_KEY")
         if not self.api_key:
@@ -87,6 +132,7 @@ class LLMExecutor:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.output_dir = Path(output_dir)
+        self.max_retries = max_retries if max_retries is not None else self.MAX_RETRIES
 
         # Initialize OpenAI client with DeepSeek endpoint
         self.client = OpenAI(
@@ -94,11 +140,14 @@ class LLMExecutor:
             base_url=self.api_base,
         )
 
+        # Metrics tracking (reset per execution)
+        self.metrics: Optional[ExecutionMetrics] = None
+
         logger.info(f"LLM Executor initialized: model={model}, base={api_base}")
 
     def execute(self, context: ExecutionContext) -> tuple[LLMResponse, ExecutionOutput]:
         """
-        Execute Stage 5: LLM call and output generation.
+        Execute Stage 5: LLM call with validation loop and output generation.
 
         Args:
             context: ExecutionContext from Stage 4
@@ -108,6 +157,9 @@ class LLMExecutor:
         """
         issue_key = context.issue_key
         logger.info(f"Stage 5: Executing LLM for {issue_key}")
+
+        # Initialize metrics for this execution
+        self.metrics = ExecutionMetrics(issue_key=issue_key)
 
         # Create output directory
         issue_dir = self.output_dir / issue_key
@@ -129,10 +181,71 @@ class LLMExecutor:
         prompt_file = self._save_prompt(issue_dir, context, user_prompt)
         logger.info(f"Saved prompt: {prompt_file}")
 
-        # Step 3: Call DeepSeek API
-        logger.info(f"Calling DeepSeek API ({self.model})...")
-        response = self._call_llm(user_prompt)
-        logger.info(f"LLM response received: {response.tokens_used} tokens, {response.finish_reason}")
+        # Step 3: Call DeepSeek API with validation loop
+        response = None
+        validation_result: Optional[ValidationResult] = None
+        max_attempts = self.max_retries + 1  # 1 initial + N retries
+
+        for attempt in range(1, max_attempts + 1):
+            start_time = time.time()
+
+            if attempt == 1:
+                # First attempt: full prompt
+                logger.info(f"Calling DeepSeek API ({self.model}), attempt {attempt}...")
+                response = self._call_llm(user_prompt)
+            else:
+                # Retry: targeted fix prompt for Work Plan only
+                logger.info(f"Retry {attempt - 1}/{self.max_retries}: Requesting Work Plan fix...")
+                response = self._call_llm_retry(
+                    original_response=response,
+                    validation_errors=validation_result.errors if validation_result else [],
+                    attempt=attempt,
+                )
+
+            duration_ms = int((time.time() - start_time) * 1000)
+
+            # Validate Work Plan section
+            validation_result = validate_work_plan(response.work_plan)
+
+            # Record metrics for this call
+            call_metrics = LLMCallMetrics(
+                tokens_in=response.tokens_in,
+                tokens_out=response.tokens_out,
+                tokens_total=response.tokens_used,
+                model=response.model,
+                call_purpose="planning" if attempt == 1 else "retry",
+                attempt_number=attempt,
+                duration_ms=duration_ms,
+                validation_attempts=1,
+                validation_passed=validation_result.is_valid,
+                validation_errors=validation_result.errors.copy(),
+            )
+            self.metrics.add_call(call_metrics)
+
+            if validation_result.is_valid:
+                logger.info(
+                    f"Attempt {attempt}: Validation PASSED "
+                    f"({validation_result.steps_found} steps, {validation_result.layers_found} layers)"
+                )
+                break
+            else:
+                logger.warning(
+                    f"Attempt {attempt}: Validation FAILED - {validation_result.errors}"
+                )
+                if validation_result.warnings:
+                    logger.warning(f"Warnings: {validation_result.warnings}")
+
+                if attempt == max_attempts:
+                    self.metrics.max_retries_hit = True
+                    logger.error(
+                        f"Max retries ({self.max_retries}) reached. "
+                        "Proceeding with potentially invalid Work Plan."
+                    )
+
+        logger.info(
+            f"LLM response finalized: {response.tokens_used} tokens, "
+            f"{response.finish_reason}, {self.metrics.retry_count} retries"
+        )
 
         # Step 4: Save reasoning (full response)
         reasoning_file = self._save_reasoning(issue_dir, context, response)
@@ -142,12 +255,17 @@ class LLMExecutor:
         plan_file = self._save_plan(issue_dir, context, response)
         logger.info(f"Saved plan: {plan_file}")
 
+        # Step 6: Save metrics
+        metrics_file = self._save_metrics(issue_dir, context)
+        logger.info(f"Saved metrics: {metrics_file}")
+
         output = ExecutionOutput(
             context_file=context_file,
             prompt_file=prompt_file,
             reasoning_file=reasoning_file,
             plan_file=plan_file,
             selection_file=selection_file,
+            metrics_file=metrics_file,
         )
 
         logger.info(f"Stage 5 complete: {issue_key}")
@@ -167,13 +285,17 @@ class LLMExecutor:
             )
 
             raw_content = completion.choices[0].message.content or ""
-            tokens_used = completion.usage.total_tokens if completion.usage else 0
+            tokens_in = completion.usage.prompt_tokens if completion.usage else 0
+            tokens_out = completion.usage.completion_tokens if completion.usage else 0
+            tokens_used = tokens_in + tokens_out
             finish_reason = completion.choices[0].finish_reason or ""
 
             response = LLMResponse(
                 raw_content=raw_content,
                 model=self.model,
                 tokens_used=tokens_used,
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
                 finish_reason=finish_reason,
             )
 
@@ -185,6 +307,76 @@ class LLMExecutor:
         except Exception as e:
             logger.error(f"LLM API call failed: {e}")
             raise
+
+    def _call_llm_retry(
+        self,
+        original_response: LLMResponse,
+        validation_errors: list[str],
+        attempt: int,
+    ) -> LLMResponse:
+        """
+        Call LLM to fix only the Work Plan section.
+
+        Uses a targeted prompt asking to fix specific validation errors.
+        Preserves other sections from the original response.
+
+        Args:
+            original_response: The original LLM response with invalid Work Plan
+            validation_errors: List of validation errors to fix
+            attempt: Current attempt number
+
+        Returns:
+            LLMResponse with fixed Work Plan (other sections preserved)
+        """
+        # Build targeted retry prompt
+        retry_prompt = RETRY_PROMPT_TEMPLATE.format(
+            errors="\n".join(f"- {e}" for e in validation_errors),
+            original_work_plan=original_response.work_plan[:WORK_PLAN_TRUNCATE_LIMIT],
+        )
+
+        try:
+            completion = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are fixing a validation error in a work plan. "
+                        "Follow the format instructions exactly.",
+                    },
+                    {"role": "user", "content": retry_prompt},
+                ],
+                temperature=0.1,  # Lower temperature for deterministic fix
+                max_tokens=4096,  # Less tokens needed for just one section
+            )
+
+            fixed_work_plan = completion.choices[0].message.content or ""
+            tokens_in = completion.usage.prompt_tokens if completion.usage else 0
+            tokens_out = completion.usage.completion_tokens if completion.usage else 0
+            tokens_used = tokens_in + tokens_out
+            finish_reason = completion.choices[0].finish_reason or ""
+
+            # Create new response with fixed work plan, preserving other sections
+            fixed_response = LLMResponse(
+                raw_content=original_response.raw_content,  # Keep original raw
+                understanding=original_response.understanding,
+                concerns=original_response.concerns,
+                analysis=original_response.analysis,
+                work_plan=fixed_work_plan.strip(),  # Use fixed version
+                definition_of_ready=original_response.definition_of_ready,
+                model=self.model,
+                tokens_used=tokens_used,
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+                finish_reason=finish_reason,
+            )
+
+            return fixed_response
+
+        except Exception as e:
+            logger.error(f"Retry call failed: {type(e).__name__}: {str(e)[:200]}")
+            # Mark failure and return original response
+            original_response.retry_failed = True
+            return original_response
 
     def _parse_response_sections(self, response: LLMResponse) -> None:
         """Parse response into sections."""
@@ -308,6 +500,18 @@ Finish Reason: {response.finish_reason}
 
 {response.definition_of_ready or '[Section not found in response]'}
 """
+        filepath.write_text(content, encoding="utf-8")
+        return filepath
+
+    def _save_metrics(self, issue_dir: Path, context: ExecutionContext) -> Path:
+        """Save LLM usage metrics to markdown file."""
+        filepath = issue_dir / f"{context.issue_key}_metrics.md"
+
+        if self.metrics:
+            content = self.metrics.to_markdown()
+        else:
+            content = f"# LLM Metrics: {context.issue_key}\n\nNo metrics collected."
+
         filepath.write_text(content, encoding="utf-8")
         return filepath
 

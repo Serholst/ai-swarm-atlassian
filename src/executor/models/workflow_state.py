@@ -14,7 +14,6 @@ class WorkflowStatus(str, Enum):
 
     BACKLOG = "Backlog"
     AI_TO_DO = "AI-TO-DO"
-    ANALYSIS = "Analysis"
     HUMAN_PLAN_REVIEW = "Human Plan Review"
     READY_FOR_DEV = "Ready for Dev"
     IN_PROGRESS = "In Progress"

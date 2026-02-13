@@ -63,19 +63,49 @@ Add bot to space with permissions:
 - ❌ Delete pages (not needed)
 - ❌ Admin (not needed)
 
-### 5. Update .env
+### 5. Generate GitHub Token (Optional)
+
+For Stage 3b (codebase context), you need a GitHub Personal Access Token.
+
+1. Go to: https://github.com/settings/tokens
+2. Click "Generate new token" → "Fine-grained tokens" (recommended)
+3. Configure:
+   - **Name**: "AI-Swarm Bot"
+   - **Expiration**: 90 days (rotate regularly)
+   - **Repository access**: Select repositories the bot should access
+   - **Permissions**:
+     - ✅ Contents: Read-only
+     - ✅ Metadata: Read-only
+     - ✅ Pull requests: Read-only (optional)
+     - ❌ Other permissions: Not needed
+
+4. Copy token immediately (shown only once)
+
+### 6. Update .env
 
 ```env
-JIRA_URL=https://your-domain.atlassian.net
-JIRA_EMAIL=ai-executor-bot@yourcompany.com
-JIRA_API_TOKEN=<bot's token>
+# Atlassian credentials (shared for Jira and Confluence)
+ATLASSIAN_URL=https://your-domain.atlassian.net
+CONFLUENCE_URL=https://your-domain.atlassian.net/wiki  # IMPORTANT: Must include /wiki suffix
 
-CONFLUENCE_URL=https://your-domain.atlassian.net
-CONFLUENCE_EMAIL=ai-executor-bot@yourcompany.com
-CONFLUENCE_API_TOKEN=<bot's token>
+# Bot account (recommended) or admin account (for testing)
+ATLASSIAN_BOT_EMAIL=ai-executor-bot@yourcompany.com
+ATLASSIAN_BOT_API_TOKEN=<bot's token>
+
+# Optional: Admin account fallback
+ATLASSIAN_ADMIN_EMAIL=your-email@example.com
+ATLASSIAN_ADMIN_API_TOKEN=<your token>
+
+# GitHub (optional - for codebase context)
+GITHUB_TOKEN=<github personal access token>
+
+# DeepSeek LLM (required)
+DEEPSEEK_API_KEY=<deepseek api key>
 ```
 
-### 6. Verify
+**Important**: `CONFLUENCE_URL` must include the `/wiki` suffix for Confluence Cloud REST API to work correctly.
+
+### 7. Verify
 
 ```bash
 ./run_tests.sh
@@ -85,6 +115,7 @@ Check that:
 - Tests pass
 - Jira comments show bot's name
 - Confluence edits show bot's name
+- GitHub context appears in output (if token configured)
 
 ## Troubleshooting
 
@@ -93,6 +124,8 @@ Check that:
 | 401 Unauthorized | Wrong email/token | Verify credentials match |
 | 403 Forbidden | No permissions | Add bot to project/space |
 | Changes show your name | Using personal token | Generate token from bot account |
+| GitHub MCP not started | Missing GITHUB_TOKEN | Add token to .env |
+| GitHub 404 Not Found | No repo access | Check token has repository access |
 
 ## Security
 

@@ -1,0 +1,182 @@
+# =============================================================================
+# SDLC Workflow Configuration (Example)
+# =============================================================================
+# Copy this file to sdlc_config.yaml and customize for your organization:
+#   cp config/sdlc_config.example.yaml config/sdlc_config.yaml
+#
+# This file defines how AI-Swarm interacts with your Jira, Confluence, and GitHub.
+
+confluence:
+  # Confluence space structure — customize to match your space
+  space_home_title: "Engineering Hub"
+  sdlc_rules_page_title: "SDLC Rules"
+  product_registry_title: "Product Registry"
+
+  # SSOT Doctrine
+  ssot_role: "State"  # Architecture, Contracts, Logic
+
+  # Project Passport structure (mandatory document fields)
+  project_passport_required_fields:
+    - "Identity & Ownership"
+    - "Technology Stack"
+    - "Repositories"
+    - "Environments"
+
+  logical_architecture_required_fields:
+    - "Component Diagram"
+    - "Data Flow"
+    - "Contracts & Interfaces"
+    - "Constraints"
+
+jira:
+  # Workflow Status Map (exact names, case-sensitive)
+  # Must match your Jira workflow configuration
+  statuses:
+    backlog: "Backlog"
+    ai_to_do: "AI To Do"
+    human_plan_review: "Human Plan Review"
+    ready_for_dev: "Ready for Dev"
+    in_progress: "In Progress"
+    review: "Review"
+    deployment: "Deployment"
+    done: "Done"
+
+  # Issue Types
+  issue_types:
+    feature: "Feature"  # Parent
+    story: "Story"      # Child
+    task: "Task"        # Blocking
+
+  # Link type for Feature→Story parent-child relationship
+  # Check your Jira: Project Settings → Issue Features → Configure Issue Links
+  parent_link_type: "Parent"
+
+  # Blocking Task Naming Patterns
+  blocking_tasks:
+    architecture_review: "[REVIEW] Approve Architecture (HUMAN)"
+    code_review_pattern: "[REVIEW] Code Review (Iter {iteration})"
+
+  # Custom Field Mapping (instance-specific)
+  # Find your field IDs: https://your-domain.atlassian.net/rest/api/3/field
+  custom_fields:
+    project_dropdown: "customfield_10072"   # "Project" dropdown
+    project_text: "customfield_10073"       # "Project" text fallback
+    project_link: "customfield_10107"       # "Project Link" URL field
+
+github:
+  ssot_role: "Implementation"  # Execution
+  branch_pattern: "feature/{key}-{slug}"
+  pr_title_pattern: "{key}: {feature_title}"
+
+  # GitHub MCP Configuration
+  mcp:
+    enabled: true
+    server: "@modelcontextprotocol/server-github"
+
+  # Context extraction settings
+  context_extraction:
+    config_files:
+      - "package.json"
+      - "pyproject.toml"
+      - "Cargo.toml"
+      - "go.mod"
+      - "pom.xml"
+      - "tsconfig.json"
+      - "docker-compose.yml"
+
+    key_directories:
+      - "src"
+      - "lib"
+      - "app"
+      - "api"
+      - "tests"
+      - "config"
+      - "docs"
+
+    max_commits: 10
+    max_prs: 10
+    max_code_snippets: 5
+    structure_depth: 3
+
+  # Deduplication: Topics to skip if covered in Confluence
+  deduplication:
+    skip_if_in_confluence:
+      - "tech_stack"
+      - "architecture"
+      - "api_contracts"
+      - "database"
+      - "deployment"
+
+# Naming Conventions
+naming:
+  # Layer Taxonomy ([LAYER])
+  layers:
+    - "BE"      # Backend, API, Microservices, Workers
+    - "FE"      # Frontend, UI/UX implementation
+    - "INFRA"   # Terraform, K8s, CI/CD pipelines
+    - "DB"      # Migrations, SQL, Schema changes
+    - "QA"      # Tests (E2E, Integration), Automation
+    - "DOCS"    # Technical writers tasks
+    - "GEN"     # General (fallback)
+
+  # Patterns
+  feature_title: "[{project_name}] {description}"
+  story_title: "[{layer}] {action}"
+  review_task: "[REVIEW] {phase_name} (HUMAN)"
+  draft_comment_header: "### DRAFT: {issue_key}_{slug}_{artifact_type}.md"
+
+# Operational Mode
+operational:
+  max_concurrent_features: 1
+  enforcement: "MANDATORY"
+  spec_first: true
+
+# Quality Gates
+gates:
+  definition_of_ready:
+    - "Clear Goal: Description is unambiguous"
+    - "Decomposition Clarity: Technical steps understood"
+    - "Resources Located: Confluence pages accessible"
+    - "Resources Located: GitHub repo accessible (or marked as new project)"
+    - "Codebase Alignment: Proposed approach aligns with existing patterns"
+
+  architecture_gate:
+    - "Plan fixed in Jira Comment"
+    - "[REVIEW] Approve Architecture marked as Done"
+
+  definition_of_done:
+    - "SSOT: Confluence matches implementation"
+    - "Code: PR merged to main"
+    - "Quality: CI Pipeline passed"
+    - "Clean-up: All child Stories closed"
+
+# Error Handling & Logging
+error_handling:
+  type_a:
+    max_retries: 3
+    action: "self_correction"
+  type_b:
+    action: "escalation"
+    blocker_prefix: "[BLOCKER]"
+  cot_required: true
+  cot_panel_title: "Executor Rationale"
+
+# Output Formats
+output:
+  default_format: "markdown"
+  allowed_formats: ["markdown"]
+  data_missing_marker: "[DATA MISSING]"
+  not_defined_marker: "[NOT DEFINED]"
+  confluence_delete_prohibited: true
+  confluence_allowed_operations: ["append", "update"]
+
+# Agent Configuration
+agent:
+  provider: "deepseek"
+  model: "deepseek-chat"
+  api_base: "https://api.deepseek.com/v1"
+  temperature: 0.2
+  max_tokens: 8192
+  min_confidence: 0.7
+  require_citations: true
+  save_prompt: true

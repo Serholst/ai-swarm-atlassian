@@ -362,19 +362,36 @@ class JiraAPIClient:
         payload = {"body": adf_body}
         return self._request("POST", url, json=payload).json()
 
-    def transition_issue(self, issue_key: str, transition_name: str) -> None:
-        """Transition issue to a new status."""
+    def transition_issue(self, issue_key: str, target_status: str) -> None:
+        """
+        Transition issue to a new status.
+
+        Args:
+            issue_key: Issue key (e.g., AI-123)
+            target_status: Target status NAME (e.g., "Human Plan Review", "Backlog")
+                          NOT the transition name - we find the transition that leads to this status
+        """
         url = f"{self.base_url}/rest/api/3/issue/{issue_key}/transitions"
         transitions = self._request("GET", url).json().get("transitions", [])
 
         transition_id = None
+        matched_transition_name = None
+
         for trans in transitions:
-            if trans["name"].lower() == transition_name.lower():
+            # Check if this transition leads to the target status
+            to_status = trans.get("to", {}).get("name", "")
+            if to_status.lower() == target_status.lower():
                 transition_id = trans["id"]
+                matched_transition_name = trans["name"]
                 break
 
         if not transition_id:
-            raise ValueError(f"Transition not found: {transition_name}")
+            # List available transitions for debugging
+            available = [f"{t['name']} -> {t.get('to', {}).get('name', '?')}" for t in transitions]
+            raise ValueError(
+                f"No transition found leading to status '{target_status}'. "
+                f"Available transitions: {available}"
+            )
 
         payload = {"transition": {"id": transition_id}}
         self._request("POST", url, json=payload)
@@ -387,7 +404,23 @@ class JiraAPIClient:
         description: str = "",
         parent_key: str | None = None,
     ) -> dict:
-        """Create a new issue."""
+        """
+        Create a new issue.
+
+        Note: In Classic Jira, 'parent' field only works for Sub-task types.
+        For Feature→Story hierarchy, create the issue first then use link_issues()
+        with appropriate link type (e.g., "Parent", "is child of").
+
+        Args:
+            project_key: Jira project key
+            issue_type: Issue type name (Feature, Story, Task, Sub-task)
+            summary: Issue title
+            description: Issue description (Markdown)
+            parent_key: Parent issue key (only used for Sub-task in Classic Jira)
+
+        Returns:
+            Created issue data with 'key' field
+        """
         url = f"{self.base_url}/rest/api/3/issue"
 
         fields = {
@@ -399,11 +432,40 @@ class JiraAPIClient:
         if description:
             fields["description"] = MarkdownToADF.convert(description)
 
-        if parent_key:
+        # In Classic Jira, parent field only works for Sub-task types
+        # For other hierarchies (Feature→Story), use link_issues() after creation
+        if parent_key and issue_type.lower() in ("sub-task", "subtask"):
             fields["parent"] = {"key": parent_key}
+        elif parent_key:
+            logger.info(f"Note: parent_key ignored for {issue_type} - use link_issues() instead")
 
         payload = {"fields": fields}
-        return self._request("POST", url, json=payload).json()
+        logger.info(f"Creating {issue_type} in {project_key}: {summary[:50]}...")
+        result = self._request("POST", url, json=payload).json()
+        logger.info(f"Created issue: {result.get('key', 'unknown')}")
+        return result
+
+    def link_issues(
+        self,
+        from_key: str,
+        to_key: str,
+        link_type: str = "Blocks",
+    ) -> None:
+        """
+        Link two issues with specified relationship type.
+
+        Args:
+            from_key: Issue that creates the link (e.g., review task)
+            to_key: Issue being linked to (e.g., original issue)
+            link_type: Link type name (e.g., "Blocks", "is blocked by", "relates to")
+        """
+        url = f"{self.base_url}/rest/api/3/issueLink"
+        payload = {
+            "type": {"name": link_type},
+            "inwardIssue": {"key": to_key},
+            "outwardIssue": {"key": from_key},
+        }
+        self._request("POST", url, json=payload)
 
 
 def extract_adf_text(adf: dict) -> str:
@@ -454,6 +516,17 @@ def extract_adf_text(adf: dict) -> str:
             lines = text.strip().split("\n")
             return "\n".join("> " + line for line in lines) + "\n"
 
+        # Handle inlineCard (smart links) - extract URL
+        if node_type == "inlineCard":
+            url = node.get("attrs", {}).get("url", "")
+            return url
+
+        # Handle link marks
+        if node_type == "link":
+            url = node.get("attrs", {}).get("href", "")
+            text = "".join(traverse(child) for child in content)
+            return f"[{text}]({url})" if text else url
+
         # Default: just traverse children
         return "".join(traverse(child) for child in content)
 
@@ -468,17 +541,25 @@ def extract_adf_text(adf: dict) -> str:
 # Initialize MCP Server
 app = Server("jira-mcp-server")
 
-# Initialize Jira client
-JIRA_URL = os.getenv("JIRA_URL", "")
-JIRA_EMAIL = os.getenv("JIRA_EMAIL", "")
-JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN", "")
+# Initialize Jira client using shared Atlassian credentials
+ATLASSIAN_URL = os.getenv("ATLASSIAN_URL", "")
+ATLASSIAN_EMAIL = os.getenv("ATLASSIAN_EMAIL", "")
+ATLASSIAN_API_TOKEN = os.getenv("ATLASSIAN_API_TOKEN", "")
 
-if not all([JIRA_URL, JIRA_EMAIL, JIRA_API_TOKEN]):
+# Custom field IDs (instance-specific — configure via env vars or .env)
+# Find your field IDs: https://your-domain.atlassian.net/rest/api/3/field
+JIRA_PROJECT_DROPDOWN_FIELD = os.getenv("JIRA_PROJECT_DROPDOWN_FIELD", "customfield_10072")
+JIRA_PROJECT_TEXT_FIELD = os.getenv("JIRA_PROJECT_TEXT_FIELD", "customfield_10073")
+JIRA_PROJECT_LINK_FIELD = os.getenv("JIRA_PROJECT_LINK_FIELD", "customfield_10107")
+
+if not all([ATLASSIAN_URL, ATLASSIAN_EMAIL, ATLASSIAN_API_TOKEN]):
     logger.error("Missing required environment variables for Jira")
+    logger.error("Set ATLASSIAN_URL, ATLASSIAN_EMAIL, ATLASSIAN_API_TOKEN")
     import sys
     sys.exit(1)
 
-jira_client = JiraAPIClient(JIRA_URL, JIRA_EMAIL, JIRA_API_TOKEN)
+logger.info(f"Jira client initialized with account: {ATLASSIAN_EMAIL}")
+jira_client = JiraAPIClient(ATLASSIAN_URL, ATLASSIAN_EMAIL, ATLASSIAN_API_TOKEN)
 
 
 def _parse_jira_user(user_data: dict | None) -> JiraUser | None:
@@ -541,14 +622,17 @@ def _parse_jira_issue(issue_data: dict) -> JiraIssue:
         description_text = str(description_adf)
 
     # Extract custom "Project" field (Confluence folder name)
-    # customfield_10072 is a dropdown, customfield_10073 is text
+    # Field IDs are configurable via env vars (see .env.example)
     project_folder = ""
-    cf_project_dropdown = fields.get("customfield_10072")
+    cf_project_dropdown = fields.get(JIRA_PROJECT_DROPDOWN_FIELD)
     if cf_project_dropdown and isinstance(cf_project_dropdown, dict):
         project_folder = cf_project_dropdown.get("value", "")
     if not project_folder:
         # Fallback to text field
-        project_folder = fields.get("customfield_10073", "") or ""
+        project_folder = fields.get(JIRA_PROJECT_TEXT_FIELD, "") or ""
+
+    # Extract custom "Project Link" field (direct Confluence URL)
+    project_link = fields.get(JIRA_PROJECT_LINK_FIELD, "") or ""
 
     return JiraIssue(
         key=issue_data["key"],
@@ -567,6 +651,7 @@ def _parse_jira_issue(issue_data: dict) -> JiraIssue:
         parent_key=parent_key,
         subtasks=subtasks,
         project_folder=project_folder,
+        project_link=project_link,
     )
 
 
@@ -647,6 +732,19 @@ async def list_tools() -> list[Tool]:
                 "required": ["project_key", "issue_type", "summary"],
             },
         ),
+        Tool(
+            name="jira_link_issues",
+            description="Link two Jira issues (e.g., Blocks, relates to)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "from_key": {"type": "string", "description": "Issue creating the link"},
+                    "to_key": {"type": "string", "description": "Issue being linked to"},
+                    "link_type": {"type": "string", "description": "Link type (Blocks, relates to)", "default": "Blocks"},
+                },
+                "required": ["from_key", "to_key"],
+            },
+        ),
     ]
 
 
@@ -665,6 +763,7 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
 **Status:** {issue.status.name}
 **Project:** {issue.project.name} ({issue.project.key})
 **Project Folder:** {issue.project_folder or 'None'}
+**Project Link:** {issue.project_link or 'None'}
 **Assignee:** {issue.assignee.display_name if issue.assignee else 'Unassigned'}
 **Labels:** {', '.join(issue.labels) if issue.labels else 'None'}
 
@@ -731,6 +830,14 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
             result = jira_client.create_issue(project_key, issue_type, summary, description, parent_key)
             new_key = result.get("key", "")
             return [TextContent(type="text", text=f"Created issue: {new_key}")]
+
+        elif name == "jira_link_issues":
+            from_key = arguments["from_key"]
+            to_key = arguments["to_key"]
+            link_type = arguments.get("link_type", "Blocks")
+
+            jira_client.link_issues(from_key, to_key, link_type)
+            return [TextContent(type="text", text=f"Linked {from_key} -> {to_key} ({link_type})")]
 
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]

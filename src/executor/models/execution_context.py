@@ -3,15 +3,19 @@ Execution context models for the 5-stage pipeline.
 
 Stage 1: Trigger → issue_key
 Stage 2: Jira Enrichment → JiraContext
-Stage 3: Confluence Knowledge → RefinedConfluenceContext (Two-Stage Retrieval)
+Stage 3a: Confluence Knowledge → RefinedConfluenceContext (Two-Stage Retrieval)
+Stage 3b: GitHub Context → GitHubContext (Confluence-filtered)
 Stage 4: Data Aggregation → ExecutionContext
 Stage 5: LLM Execution → uses ExecutionContext.prompt_context
 """
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional, Union
+from typing import Optional, Union, TYPE_CHECKING
 from enum import Enum
+
+if TYPE_CHECKING:
+    from .github_models import GitHubContext
 
 
 class ProjectStatus(Enum):
@@ -19,6 +23,7 @@ class ProjectStatus(Enum):
     EXISTING = "existing"      # Has Passport + Architecture
     NEW_PROJECT = "new"        # Folder exists but no mandatory docs
     NOT_FOUND = "not_found"    # Folder doesn't exist
+    BRAND_NEW = "brand_new"    # No project_link AND no project_folder (greenfield)
 
 
 class ContextLocationError(Exception):
@@ -64,6 +69,9 @@ class JiraContext:
 
     # Confluence folder name (from custom "Project" field)
     project_folder: str = ""
+
+    # Direct Confluence link (from custom "Project Link" field)
+    project_link: str = ""
 
     # Timestamps
     created: Optional[str] = None
@@ -238,7 +246,8 @@ class ExecutionContext:
     # Stage 2 & 3 outputs
     jira: Optional[JiraContext] = None
     confluence: Optional[ConfluenceContext] = None
-    refined_confluence: Optional[RefinedConfluenceContext] = None  # New Two-Stage Retrieval
+    refined_confluence: Optional[RefinedConfluenceContext] = None  # Two-Stage Retrieval
+    github: Optional["GitHubContext"] = None  # GitHub context (Confluence-filtered)
 
     # Aggregation status
     errors: list[str] = field(default_factory=list)
@@ -299,6 +308,27 @@ class ExecutionContext:
             sections.append(f"**Space:** {self.refined_confluence.project_space}")
             sections.append(f"**Status:** {self.refined_confluence.project_status.value}")
             sections.append("")
+
+            # Brand-new project signal (greenfield)
+            if self.refined_confluence.project_status == ProjectStatus.BRAND_NEW:
+                sections.append("### BRAND NEW PROJECT")
+                sections.append("")
+                sections.append("**IMPORTANT:** This is a greenfield project with no existing Confluence documentation.")
+                sections.append("")
+                sections.append("Your work plan MUST include steps to create:")
+                sections.append("1. **Project Passport** page with sections:")
+                sections.append("   - Identity & Ownership")
+                sections.append("   - Technology Stack")
+                sections.append("   - Repositories")
+                sections.append("   - Environments")
+                sections.append("2. **Logical Architecture** page with sections:")
+                sections.append("   - Component Diagram")
+                sections.append("   - Data Flow")
+                sections.append("   - Contracts & Interfaces")
+                sections.append("   - Constraints")
+                sections.append("")
+                sections.append("Use `[DOCS]` layer for documentation creation steps.")
+                sections.append("")
 
             # Core documents (Mandatory Path)
             if self.refined_confluence.core_documents:
@@ -375,6 +405,14 @@ class ExecutionContext:
                 for err in self.confluence.retrieval_errors:
                     sections.append(f"- {err}")
                 sections.append("")
+
+        # GitHub section
+        if self.github:
+            sections.append("---")
+            sections.append("")
+            sections.append("## Codebase Context (GitHub)")
+            sections.append("")
+            sections.append(self.github.format_markdown())
 
         # Global errors
         if self.errors:

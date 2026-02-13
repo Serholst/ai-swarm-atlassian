@@ -10,9 +10,9 @@ Stages:
 5. LLM Execution - Generate work plan via DeepSeek
 
 Usage:
-    python3 execute.py --task WEB3-6
-    python3 execute.py --task WEB3-6 --dry-run  # Skip LLM call
-    python3 execute.py --task WEB3-6 --output-dir ./my_outputs
+    python3 execute.py --task PROJ-123
+    python3 execute.py --task PROJ-123 --dry-run  # Skip LLM call
+    python3 execute.py --task PROJ-123 --output-dir ./my_outputs
 """
 
 import argparse
@@ -36,6 +36,8 @@ from executor.phases import (
     build_context_pipeline,
     build_refined_context_pipeline,
     LLMExecutor,
+    handle_post_execution,
+    ExecutionOutcome,
 )
 from openai import OpenAI
 
@@ -50,37 +52,51 @@ def load_environment() -> dict[str, str]:
 
     if not env_file.exists():
         console.print("[red]Error: .env file not found[/red]")
-        console.print(f"Please create {env_file} based on .env.example")
+        console.print("Please create .env based on .env.example:")
+        console.print("  cp .env.example .env")
         sys.exit(1)
 
     load_dotenv(env_file)
 
-    required_vars = [
-        "JIRA_URL",
-        "JIRA_EMAIL",
-        "JIRA_API_TOKEN",
-    ]
-
     env_vars = {}
-    missing_vars = []
 
-    for var in required_vars:
-        value = os.getenv(var)
-        if not value:
-            missing_vars.append(var)
-        else:
-            env_vars[var] = value
+    # Atlassian URL (shared for Jira and Confluence)
+    atlassian_url = os.getenv("ATLASSIAN_URL")
+    if not atlassian_url:
+        console.print("[red]Error: ATLASSIAN_URL is required[/red]")
+        sys.exit(1)
+    env_vars["ATLASSIAN_URL"] = atlassian_url
 
-    if missing_vars:
-        console.print("[red]Error: Missing required environment variables:[/red]")
-        for var in missing_vars:
-            console.print(f"  - {var}")
+    # Confluence URL (with /wiki suffix for Confluence Cloud)
+    confluence_url = os.getenv("CONFLUENCE_URL", "")
+    if not confluence_url:
+        confluence_url = atlassian_url.rstrip("/") + "/wiki"
+    env_vars["CONFLUENCE_URL"] = confluence_url
+
+    # Bot account credentials (used for all Jira/Confluence operations)
+    bot_email = os.getenv("ATLASSIAN_BOT_EMAIL", "")
+    bot_token = os.getenv("ATLASSIAN_BOT_API_TOKEN", "")
+
+    # Admin credentials (fallback, not recommended for automation)
+    admin_email = os.getenv("ATLASSIAN_ADMIN_EMAIL", "")
+    admin_token = os.getenv("ATLASSIAN_ADMIN_API_TOKEN", "")
+
+    # Prefer bot account, fallback to admin
+    env_vars["ATLASSIAN_EMAIL"] = bot_email or admin_email
+    env_vars["ATLASSIAN_API_TOKEN"] = bot_token or admin_token
+
+    if not env_vars["ATLASSIAN_EMAIL"] or not env_vars["ATLASSIAN_API_TOKEN"]:
+        console.print("[red]Error: Missing Atlassian credentials[/red]")
+        console.print("Set ATLASSIAN_BOT_EMAIL/ATLASSIAN_BOT_API_TOKEN (recommended)")
+        console.print("Or ATLASSIAN_ADMIN_EMAIL/ATLASSIAN_ADMIN_API_TOKEN (fallback)")
         sys.exit(1)
 
-    # Optional Confluence variables
-    env_vars["CONFLUENCE_URL"] = os.getenv("CONFLUENCE_URL", "")
-    env_vars["CONFLUENCE_EMAIL"] = os.getenv("CONFLUENCE_EMAIL", "")
-    env_vars["CONFLUENCE_API_TOKEN"] = os.getenv("CONFLUENCE_API_TOKEN", "")
+    # Log which account is being used
+    account_type = "bot" if bot_email else "admin"
+    console.print(f"  Using Atlassian {account_type} account: {env_vars['ATLASSIAN_EMAIL']}")
+
+    # Optional GitHub token for codebase context
+    env_vars["GITHUB_TOKEN"] = os.getenv("GITHUB_TOKEN", "")
 
     return env_vars
 
@@ -149,6 +165,9 @@ def execute_pipeline(
         # =================================================================
         console.print("\n[bold]Stages 2-4: Building Context[/bold]")
 
+        execution_context = None
+        context_error = None
+
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -162,26 +181,51 @@ def execute_pipeline(
                 "sdlc_rules_page_title", "SDLC & Workflows Rules"
             )
 
-            # Use Two-Stage Retrieval if DeepSeek is available
-            if deepseek_client:
-                progress.update(task, description="Stage 2: Jira Enrichment...")
-                execution_context = build_refined_context_pipeline(
+            try:
+                # Use Two-Stage Retrieval if DeepSeek is available
+                if deepseek_client:
+                    progress.update(task, description="Stage 2: Jira Enrichment...")
+                    execution_context = build_refined_context_pipeline(
+                        mcp=mcp,
+                        llm_client=deepseek_client,
+                        task_input=issue_key,
+                        config=config.model_dump(),
+                    )
+                    progress.update(task, description="Stage 3: Confluence Knowledge (LLM Filtering)...")
+                    progress.update(task, description="Stage 4: Data Aggregation...")
+                else:
+                    # Legacy pipeline (no LLM filtering)
+                    execution_context = build_context_pipeline(
+                        mcp=mcp,
+                        task_input=issue_key,
+                        sdlc_rules_title=sdlc_title,
+                    )
+                    progress.update(task, description="Stage 3: Confluence Knowledge...")
+                    progress.update(task, description="Stage 4: Data Aggregation...")
+            except Exception as e:
+                context_error = e
+                logger.error(f"Context building failed: {e}")
+
+        # Handle context building failure
+        if context_error:
+            console.print(f"\n[red]✗ Context building failed: {context_error}[/red]")
+
+            # Post-execution: transition to Backlog
+            if not dry_run:
+                console.print("\n[bold]Post-Execution: Transitioning to Backlog[/bold]")
+                result = handle_post_execution(
                     mcp=mcp,
-                    llm_client=deepseek_client,
-                    task_input=issue_key,
-                    config=config.model_dump(),
+                    issue_key=issue_key,
+                    execution_context=execution_context,
+                    execution_error=context_error,
+                    dry_run=False,
                 )
-                progress.update(task, description="Stage 3: Confluence Knowledge (LLM Filtering)...")
-                progress.update(task, description="Stage 4: Data Aggregation...")
-            else:
-                # Legacy pipeline (no LLM filtering)
-                execution_context = build_context_pipeline(
-                    mcp=mcp,
-                    task_input=issue_key,
-                    sdlc_rules_title=sdlc_title,
-                )
-                progress.update(task, description="Stage 3: Confluence Knowledge...")
-                progress.update(task, description="Stage 4: Data Aggregation...")
+                if result.error:
+                    console.print(f"  [yellow]⚠[/yellow] Transition failed: {result.error}")
+                else:
+                    console.print(f"  [green]✓[/green] Transitioned to {result.target_status}")
+                    console.print(f"  [green]✓[/green] Added explanation comment")
+            return 1
 
         # Display context summary
         console.print(f"  [green]✓[/green] Jira: {execution_context.jira.summary[:50]}...")
@@ -231,6 +275,21 @@ def execute_pipeline(
             console.print("\n[red]✗ Context validation failed[/red]")
             for err in execution_context.errors:
                 console.print(f"  - {err}")
+
+            # Post-execution: transition to Backlog
+            if not dry_run:
+                console.print("\n[bold]Post-Execution: Transitioning to Backlog[/bold]")
+                result = handle_post_execution(
+                    mcp=mcp,
+                    issue_key=issue_key,
+                    execution_context=execution_context,
+                    dry_run=False,
+                )
+                if result.error:
+                    console.print(f"  [yellow]⚠[/yellow] Transition failed: {result.error}")
+                else:
+                    console.print(f"  [green]✓[/green] Transitioned to {result.target_status}")
+                    console.print(f"  [green]✓[/green] Added explanation comment")
             return 1
 
         # =================================================================
@@ -308,6 +367,37 @@ def execute_pipeline(
                 console.print("\n[bold yellow]Concerns & Uncertainties:[/bold yellow]")
                 console.print(Markdown(response.concerns[:500]))
 
+            # =================================================================
+            # Post-Execution: Analysis & Decomposition + Transition
+            # =================================================================
+            console.print("\n[bold]Post-Execution: Analysis & Decomposition[/bold]")
+            result = handle_post_execution(
+                mcp=mcp,
+                issue_key=issue_key,
+                execution_context=execution_context,
+                plan_summary=response.work_plan[:1000] if response.work_plan else None,
+                llm_response=response,
+                config=config.model_dump(),
+                dry_run=False,
+            )
+
+            # Show decomposition results
+            if result.decomposition_result:
+                dr = result.decomposition_result
+                console.print(f"  [green]✓[/green] Parsed {len(dr.stories)} stories")
+                if dr.review_task_key:
+                    console.print(f"  [green]✓[/green] Created review task: {dr.review_task_key}")
+                else:
+                    console.print(f"  [yellow]⚠[/yellow] Review task creation failed")
+                if dr.has_questions():
+                    console.print(f"  [yellow]![/yellow] {len(dr.questions)} clarifications needed")
+                console.print(f"  [green]✓[/green] Added decomposition comments")
+
+            if result.error:
+                console.print(f"  [yellow]⚠[/yellow] Transition failed: {result.error}")
+            else:
+                console.print(f"  [green]✓[/green] Transitioned to {result.target_status}")
+
         console.print("\n[bold green]✓ Pipeline completed successfully[/bold green]")
         return 0
 
@@ -329,9 +419,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python3 execute.py --task WEB3-6
-  python3 execute.py --task WEB3-6 --dry-run
-  python3 execute.py -t WEB3-6 -o ./my_outputs
+  python3 execute.py --task PROJ-123
+  python3 execute.py --task PROJ-123 --dry-run
+  python3 execute.py -t PROJ-123 -o ./my_outputs
 
 Stages:
   1. Trigger       - Parse Jira issue key

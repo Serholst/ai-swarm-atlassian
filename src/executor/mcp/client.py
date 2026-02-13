@@ -2,18 +2,20 @@
 MCP Client Manager for interacting with custom MCP servers.
 
 This client wraps the MCP protocol and provides a simple interface
-for the Executor Agent to interact with Jira and Confluence.
+for the Executor Agent to interact with Jira, Confluence, and GitHub.
 
 Features:
 - Async I/O for non-blocking operations
 - Unique request IDs for request/response correlation
 - Proper process lifecycle management
+- GitHub MCP via official @modelcontextprotocol/server-github
 """
 
 import asyncio
 import subprocess
 import json
 import logging
+import shutil
 from typing import Any
 from pathlib import Path
 import threading
@@ -41,17 +43,28 @@ class MCPClient:
     Client for interacting with a single MCP server.
 
     This client communicates with MCP servers via stdio with async support.
+    Supports both Python scripts and external commands (e.g., npx for GitHub MCP).
     """
 
-    def __init__(self, server_script: str, env: dict[str, str] | None = None):
+    def __init__(
+        self,
+        server_script: str | None = None,
+        env: dict[str, str] | None = None,
+        command: str | None = None,
+        args: list[str] | None = None,
+    ):
         """
         Initialize MCP client.
 
         Args:
-            server_script: Path to MCP server script
+            server_script: Path to MCP server script (Python)
             env: Environment variables for server
+            command: External command to run (e.g., "npx")
+            args: Arguments for external command
         """
         self.server_script = server_script
+        self.command = command
+        self.args = args or []
         self.env = env or {}
         self.process: subprocess.Popen | None = None
         self._id_generator = RequestIDGenerator()
@@ -70,8 +83,18 @@ class MCPClient:
         env = os.environ.copy()
         env.update(self.env)
 
+        # Determine command to run
+        if self.command:
+            # External command (e.g., npx for GitHub MCP)
+            cmd = [self.command] + self.args
+            server_name = f"{self.command} {' '.join(self.args)}"
+        else:
+            # Python script (Jira, Confluence servers)
+            cmd = [sys.executable, self.server_script]
+            server_name = self.server_script
+
         self.process = subprocess.Popen(
-            [sys.executable, self.server_script],
+            cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -80,7 +103,7 @@ class MCPClient:
             bufsize=1,  # Line buffered
         )
 
-        logger.info(f"Started MCP server: {self.server_script}")
+        logger.info(f"Started MCP server: {server_name}")
 
         # Perform MCP initialization handshake
         self._initialize()
@@ -226,7 +249,7 @@ class MCPClient:
 
 class MCPClientManager:
     """
-    Manager for multiple MCP clients (Jira, Confluence, etc.).
+    Manager for multiple MCP clients (Jira, Confluence, GitHub).
 
     This provides a unified interface for the Executor Agent.
     """
@@ -251,29 +274,55 @@ class MCPClientManager:
         Args:
             env_vars: Environment variables (API tokens, etc.)
         """
-        # Start Jira server
+        # Start Jira server (uses shared Atlassian credentials)
         jira_server = self.server_dir / "jira_server.py"
+        jira_env = {
+            "ATLASSIAN_URL": env_vars.get("ATLASSIAN_URL", ""),
+            "ATLASSIAN_EMAIL": env_vars.get("ATLASSIAN_EMAIL", ""),
+            "ATLASSIAN_API_TOKEN": env_vars.get("ATLASSIAN_API_TOKEN", ""),
+        }
+        # Pass custom field IDs if configured (instance-specific)
+        import os
+        for field_var in ("JIRA_PROJECT_DROPDOWN_FIELD", "JIRA_PROJECT_TEXT_FIELD", "JIRA_PROJECT_LINK_FIELD"):
+            value = os.getenv(field_var, "")
+            if value:
+                jira_env[field_var] = value
         self.clients["jira"] = MCPClient(
-            str(jira_server),
-            env={
-                "JIRA_URL": env_vars.get("JIRA_URL", ""),
-                "JIRA_EMAIL": env_vars.get("JIRA_EMAIL", ""),
-                "JIRA_API_TOKEN": env_vars.get("JIRA_API_TOKEN", ""),
-            },
+            server_script=str(jira_server),
+            env=jira_env,
         )
         self.clients["jira"].start()
 
-        # Start Confluence server
+        # Start Confluence server (uses shared Atlassian credentials)
+        # CONFLUENCE_URL should include /wiki suffix for Confluence Cloud
         confluence_server = self.server_dir / "confluence_server.py"
         self.clients["confluence"] = MCPClient(
-            str(confluence_server),
+            server_script=str(confluence_server),
             env={
+                "ATLASSIAN_URL": env_vars.get("ATLASSIAN_URL", ""),
                 "CONFLUENCE_URL": env_vars.get("CONFLUENCE_URL", ""),
-                "CONFLUENCE_EMAIL": env_vars.get("CONFLUENCE_EMAIL", ""),
-                "CONFLUENCE_API_TOKEN": env_vars.get("CONFLUENCE_API_TOKEN", ""),
+                "ATLASSIAN_EMAIL": env_vars.get("ATLASSIAN_EMAIL", ""),
+                "ATLASSIAN_API_TOKEN": env_vars.get("ATLASSIAN_API_TOKEN", ""),
             },
         )
         self.clients["confluence"].start()
+
+        # Start GitHub server (official MCP server via npx)
+        github_token = env_vars.get("GITHUB_TOKEN", "")
+        if github_token:
+            # Check if npx is available
+            if shutil.which("npx"):
+                self.clients["github"] = MCPClient(
+                    command="npx",
+                    args=["-y", "@modelcontextprotocol/server-github"],
+                    env={"GITHUB_PERSONAL_ACCESS_TOKEN": github_token},
+                )
+                self.clients["github"].start()
+                logger.info("GitHub MCP server started")
+            else:
+                logger.warning("npx not found - GitHub MCP server not started. Install Node.js to enable GitHub integration.")
+        else:
+            logger.info("GITHUB_TOKEN not set - GitHub MCP server not started")
 
         logger.info("All MCP servers started")
 
@@ -315,6 +364,61 @@ class MCPClientManager:
             "jira_get_comments", {"issue_key": issue_key}
         )
 
+    def jira_create_issue(
+        self,
+        project_key: str,
+        issue_type: str,
+        summary: str,
+        description: str = "",
+        parent_key: str | None = None,
+    ) -> str:
+        """
+        Create a new Jira issue.
+
+        Args:
+            project_key: Jira project key
+            issue_type: Issue type (Feature, Story, Task)
+            summary: Issue title
+            description: Issue description (Markdown)
+            parent_key: Parent issue key (for Stories)
+
+        Returns:
+            Result message with created issue key
+        """
+        args: dict[str, Any] = {
+            "project_key": project_key,
+            "issue_type": issue_type,
+            "summary": summary,
+        }
+        if description:
+            args["description"] = description
+        if parent_key:
+            args["parent_key"] = parent_key
+
+        return self.clients["jira"].call_tool("jira_create_issue", args)
+
+    def jira_link_issues(
+        self,
+        from_key: str,
+        to_key: str,
+        link_type: str = "Blocks",
+    ) -> str:
+        """
+        Link two Jira issues.
+
+        Args:
+            from_key: Issue creating the link (e.g., review task)
+            to_key: Issue being linked to (e.g., original issue)
+            link_type: Link type (Blocks, relates to, etc.)
+
+        Returns:
+            Result message
+        """
+        return self.clients["jira"].call_tool(
+            "jira_link_issues",
+            {"from_key": from_key, "to_key": to_key, "link_type": link_type}
+        )
+
     def confluence_get_page(
         self, page_id: str | None = None, space_key: str | None = None, title: str | None = None
     ) -> str:
@@ -339,6 +443,12 @@ class MCPClientManager:
         """Get Confluence space homepage."""
         return self.clients["confluence"].call_tool(
             "confluence_get_space_home", {"space_key": space_key}
+        )
+
+    def confluence_get_page_ancestors(self, page_id: str) -> str:
+        """Get Confluence page ancestors (parent chain)."""
+        return self.clients["confluence"].call_tool(
+            "confluence_get_page_ancestors", {"page_id": page_id}
         )
 
     # Async methods (new API)
@@ -374,6 +484,184 @@ class MCPClientManager:
         return await self.clients["confluence"].call_tool_async(
             "confluence_search_pages", {"cql": cql, "limit": limit}
         )
+
+    # GitHub methods (official MCP server)
+
+    def github_available(self) -> bool:
+        """Check if GitHub MCP client is available."""
+        return "github" in self.clients and self.clients["github"].process is not None
+
+    def github_get_file_contents(self, owner: str, repo: str, path: str, branch: str | None = None) -> str:
+        """
+        Get file contents from a GitHub repository.
+
+        Args:
+            owner: Repository owner
+            repo: Repository name
+            path: File path in repository
+            branch: Branch name (optional, defaults to repo default)
+
+        Returns:
+            File contents as string
+        """
+        if not self.github_available():
+            raise RuntimeError("GitHub MCP client not available")
+
+        args = {"owner": owner, "repo": repo, "path": path}
+        if branch:
+            args["branch"] = branch
+
+        return self.clients["github"].call_tool("get_file_contents", args)
+
+    def github_search_code(self, query: str) -> str:
+        """
+        Search code across GitHub repositories.
+
+        Args:
+            query: Search query (GitHub code search syntax)
+
+        Returns:
+            Search results as string
+        """
+        if not self.github_available():
+            raise RuntimeError("GitHub MCP client not available")
+
+        return self.clients["github"].call_tool("search_code", {"query": query})
+
+    def github_list_commits(self, owner: str, repo: str, per_page: int = 10, sha: str | None = None) -> str:
+        """
+        List recent commits in a repository.
+
+        Args:
+            owner: Repository owner
+            repo: Repository name
+            per_page: Number of commits to return (default 10)
+            sha: Branch or commit SHA (optional)
+
+        Returns:
+            Commits list as string
+        """
+        if not self.github_available():
+            raise RuntimeError("GitHub MCP client not available")
+
+        args = {"owner": owner, "repo": repo, "perPage": per_page}
+        if sha:
+            args["sha"] = sha
+
+        return self.clients["github"].call_tool("list_commits", args)
+
+    def github_get_pull_request(self, owner: str, repo: str, pull_number: int) -> str:
+        """
+        Get details of a pull request.
+
+        Args:
+            owner: Repository owner
+            repo: Repository name
+            pull_number: PR number
+
+        Returns:
+            PR details as string
+        """
+        if not self.github_available():
+            raise RuntimeError("GitHub MCP client not available")
+
+        return self.clients["github"].call_tool(
+            "get_pull_request",
+            {"owner": owner, "repo": repo, "pull_number": pull_number}
+        )
+
+    def github_list_pull_requests(self, owner: str, repo: str, state: str = "open") -> str:
+        """
+        List pull requests in a repository.
+
+        Args:
+            owner: Repository owner
+            repo: Repository name
+            state: PR state (open, closed, all)
+
+        Returns:
+            PR list as string
+        """
+        if not self.github_available():
+            raise RuntimeError("GitHub MCP client not available")
+
+        # Note: Tool might be named list_pull_requests or get_pull_requests
+        try:
+            return self.clients["github"].call_tool(
+                "list_pull_requests",
+                {"owner": owner, "repo": repo, "state": state}
+            )
+        except RuntimeError:
+            # Try alternative tool name
+            return self.clients["github"].call_tool(
+                "search_pull_requests",
+                {"owner": owner, "repo": repo, "state": state}
+            )
+
+    def github_get_repository(self, owner: str, repo: str) -> str:
+        """
+        Get repository information by fetching README or root directory.
+
+        Note: Official GitHub MCP doesn't have get_repository tool,
+        so we use get_file_contents on root to verify repo exists.
+
+        Args:
+            owner: Repository owner
+            repo: Repository name
+
+        Returns:
+            Repository info as string
+        """
+        if not self.github_available():
+            raise RuntimeError("GitHub MCP client not available")
+
+        # Use get_file_contents to verify repo exists and get structure
+        return self.clients["github"].call_tool(
+            "get_file_contents",
+            {"owner": owner, "repo": repo, "path": ""}
+        )
+
+    def github_get_directory_tree(self, owner: str, repo: str, path: str = "", branch: str | None = None) -> str:
+        """
+        Get directory structure of a repository path.
+
+        Args:
+            owner: Repository owner
+            repo: Repository name
+            path: Directory path (empty for root)
+            branch: Branch name (optional)
+
+        Returns:
+            Directory tree as string
+        """
+        if not self.github_available():
+            raise RuntimeError("GitHub MCP client not available")
+
+        args = {"owner": owner, "repo": repo, "path": path}
+        if branch:
+            args["branch"] = branch
+
+        return self.clients["github"].call_tool("get_file_contents", args)
+
+    # Async GitHub methods
+
+    async def github_get_file_contents_async(self, owner: str, repo: str, path: str, branch: str | None = None) -> str:
+        """Get file contents asynchronously."""
+        if not self.github_available():
+            raise RuntimeError("GitHub MCP client not available")
+
+        args = {"owner": owner, "repo": repo, "path": path}
+        if branch:
+            args["branch"] = branch
+
+        return await self.clients["github"].call_tool_async("get_file_contents", args)
+
+    async def github_search_code_async(self, query: str) -> str:
+        """Search code asynchronously."""
+        if not self.github_available():
+            raise RuntimeError("GitHub MCP client not available")
+
+        return await self.clients["github"].call_tool_async("search_code", {"query": query})
 
     def __enter__(self):
         """Context manager entry."""

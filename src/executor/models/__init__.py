@@ -26,6 +26,15 @@ from .execution_context import (
     RefinedConfluenceContext,
     SelectionLog,
 )
+from .decomposition import (
+    DecomposedStory,
+    ClarificationQuestion,
+    DecompositionResult,
+)
+from .llm_metrics import (
+    LLMCallMetrics,
+    ExecutionMetrics,
+)
 
 __all__ = [
     # Jira models
@@ -53,4 +62,11 @@ __all__ = [
     "RefinedDocument",
     "RefinedConfluenceContext",
     "SelectionLog",
+    # Decomposition models
+    "DecomposedStory",
+    "ClarificationQuestion",
+    "DecompositionResult",
+    # LLM metrics models
+    "LLMCallMetrics",
+    "ExecutionMetrics",
 ]

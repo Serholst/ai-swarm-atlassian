@@ -9,13 +9,13 @@ Build the 5-stage pipeline that transforms a Jira issue into an LLM-generated wo
 ## Stage 1: Trigger (Инициация)
 
 **Event:** Receive Jira issue ID via CLI
-**Input:** `python execute.py --task WEB3-6`
-**Output:** Validated issue key (e.g., `WEB3-6`)
+**Input:** `python execute.py --task PROJ-123`
+**Output:** Validated issue key (e.g., `PROJ-123`)
 
 ### Implementation
 ```python
 # Already exists in execute.py:30-48
-issue_key = parse_jira_key(task_input)  # WEB3-6 or URL → WEB3-6
+issue_key = parse_jira_key(task_input)  # PROJ-123 or URL → PROJ-123
 ```
 
 ### Validation Rules
@@ -47,7 +47,7 @@ issue_key = parse_jira_key(task_input)  # WEB3-6 or URL → WEB3-6
 ### Key Logic
 ```python
 # Extract Confluence space key from labels or project
-# Priority: label "web3" → project key "WEB3" → fallback "AI"
+# Priority: label "myproject" → project key "PROJ" → fallback "AI"
 confluence_space_key = extract_space_key(issue.labels, issue.project.key)
 ```
 
@@ -71,7 +71,7 @@ class JiraContext:
 
 ---
 
-## Stage 3: Knowledge Retrieval (Сбор знаний из Confluence)
+## Stage 3a: Knowledge Retrieval (Сбор знаний из Confluence)
 
 **Input:** `confluence_space_key` from Stage 2
 **Output:** `ConfluenceContext` with space content + SDLC rules
@@ -126,9 +126,136 @@ class ConfluenceContext:
 
 ---
 
+## Stage 3b: GitHub Context Extraction (Сбор контекста из GitHub)
+
+**Input:** `JiraContext` + `ConfluenceContext` (for deduplication)
+**Output:** `GitHubContext` with repository structure, configs, commits
+
+### 3b.1 URL Discovery (Priority Order)
+
+```python
+# Extract GitHub URL from multiple sources
+def extract_github_url(jira_context, confluence_context) -> str | None:
+    # Priority 1: Jira description (inlineCard smart links)
+    url = extract_from_text(jira_context.description)
+    if url:
+        return url
+
+    # Priority 2: Confluence Project Passport
+    if confluence_context.project_passport:
+        url = extract_from_text(confluence_context.project_passport)
+        if url:
+            return url
+
+    # Priority 3: Confluence Logical Architecture
+    if confluence_context.logical_architecture:
+        url = extract_from_text(confluence_context.logical_architecture)
+        if url:
+            return url
+
+    return None  # No GitHub URL found → project_status = NEW_PROJECT
+```
+
+### 3b.2 Repository Context Extraction
+
+```python
+# Extract codebase context using official GitHub MCP
+def extract_github_context(mcp, owner, repo) -> GitHubContext:
+    # Get repository structure (tree format)
+    structure = mcp.github_get_file_contents(owner, repo, "")
+
+    # Get configuration files
+    configs = []
+    for config_file in ["pyproject.toml", "package.json", "requirements.txt"]:
+        try:
+            content = mcp.github_get_file_contents(owner, repo, config_file)
+            configs.append(ConfigSummary(name=config_file, summary=content[:500]))
+        except:
+            pass
+
+    # Get recent commits
+    commits = mcp.github_list_commits(owner, repo, per_page=10)
+
+    return GitHubContext(
+        repository_url=f"https://github.com/{owner}/{repo}",
+        status=RepoStatus.EXISTS,
+        structure=structure,
+        configs=configs,
+        recent_commits=commits
+    )
+```
+
+### 3b.3 Confluence Deduplication
+
+```python
+# Skip topics already covered in Confluence
+def extract_confluence_topics(confluence_context) -> set[str]:
+    """Extract topics from Confluence for deduplication."""
+    topics = set()
+
+    # Check Project Passport and Logical Architecture for covered topics
+    for doc in [confluence_context.project_passport, confluence_context.logical_architecture]:
+        if doc:
+            if "technology stack" in doc.lower():
+                topics.add("tech_stack")
+            if "architecture" in doc.lower():
+                topics.add("architecture")
+            # ... more topic patterns
+
+    return topics
+
+# Apply deduplication before fetching GitHub content
+skipped_topics = extract_confluence_topics(confluence_context)
+github_context.skipped_topics = list(skipped_topics)
+```
+
+### Output Model
+
+```python
+from enum import Enum
+from dataclasses import dataclass, field
+
+class RepoStatus(Enum):
+    EXISTS = "exists"
+    NOT_FOUND = "not_found"
+    NEW_PROJECT = "new_project"
+
+@dataclass
+class GitHubContext:
+    repository_url: str | None = None
+    status: RepoStatus = RepoStatus.NEW_PROJECT
+    discovery_source: str = "none"  # "jira", "confluence_passport", etc.
+    owner: str = ""
+    repo_name: str = ""
+
+    # Repository data
+    structure: RepoStructure | None = None
+    configs: list[ConfigSummary] = field(default_factory=list)
+    recent_commits: list[str] = field(default_factory=list)
+
+    # Deduplication tracking
+    skipped_topics: list[str] = field(default_factory=list)
+```
+
+### MCP Integration
+
+GitHub MCP uses the official `@modelcontextprotocol/server-github` server:
+
+```python
+# In MCPClientManager.start_all()
+if github_token:
+    self.clients["github"] = MCPClient(
+        command="npx",
+        args=["-y", "@modelcontextprotocol/server-github"],
+        env={"GITHUB_PERSONAL_ACCESS_TOKEN": github_token},
+    )
+```
+
+---
+
 ## Stage 4: Data Aggregation (Формирование контекста)
 
-**Input:** `JiraContext` + `ConfluenceContext`
+**Input:** `JiraContext` + `ConfluenceContext` + `GitHubContext`
 **Output:** Unified `ExecutionContext` ready for LLM
 
 ### Aggregation Structure
@@ -304,7 +431,7 @@ Focus on actionable steps that can be executed.
 
 1. **`{issue_key}_context.md`** - Raw aggregated context (Stage 4 output)
 ```markdown
-# Context for WEB3-6
+# Context for PROJ-123
 Generated: 2024-01-15T10:30:00Z
 
 ## Jira Data
@@ -316,7 +443,7 @@ Generated: 2024-01-15T10:30:00Z
 
 2. **`{issue_key}_prompt.md`** - Full prompt BEFORE sending to LLM (saved for validation)
 ```markdown
-# LLM Prompt for WEB3-6
+# LLM Prompt for PROJ-123
 Generated: 2024-01-15T10:30:00Z
 Model: deepseek-chat
 Temperature: 0.2
@@ -336,7 +463,7 @@ Temperature: 0.2
 
 3. **`{issue_key}_reasoning.md`** - LLM response: chain-of-thought
 ```markdown
-# Agent Reasoning for WEB3-6
+# Agent Reasoning for PROJ-123
 
 ## Understanding
 ...
@@ -351,7 +478,7 @@ Temperature: 0.2
 
 4. **`{issue_key}_plan.md`** - Final work plan (extracted from LLM response)
 ```markdown
-# Work Plan: WEB3-6
+# Work Plan: PROJ-123
 
 ## Summary
 [One-line summary]
@@ -388,13 +515,20 @@ Stage 4 → Save context.md
 
 ```
 src/executor/
+├── mcp/
+│   ├── client.py             # MCP client manager (Jira, Confluence, GitHub)
+│   └── servers/
+│       ├── jira_server.py        # Jira MCP (ADF→Markdown)
+│       └── confluence_server.py  # Confluence MCP
 ├── phases/
 │   ├── __init__.py
-│   ├── context_builder.py    # Stages 1-4: JiraContext, ConfluenceContext, ExecutionContext
+│   ├── context_builder.py    # Stages 1-4: Jira, Confluence, GitHub context
 │   └── llm_executor.py       # Stage 5: LLM call, output generation
 ├── models/
-│   ├── execution_context.py  # New: ExecutionContext model
-│   └── ...
+│   ├── execution_context.py  # ExecutionContext model
+│   ├── jira_models.py        # Jira data models
+│   ├── confluence_models.py  # Confluence data models
+│   └── github_models.py      # GitHub context models (NEW)
 └── prompts/
     ├── __init__.py
     ├── system_prompt.py      # System prompt template
@@ -403,6 +537,8 @@ src/executor/
 outputs/
 └── {issue_key}/
     ├── {issue_key}_context.md
+    ├── {issue_key}_selection.md
+    ├── {issue_key}_prompt.md
     ├── {issue_key}_reasoning.md
     └── {issue_key}_plan.md
 ```
@@ -434,11 +570,13 @@ outputs/
 
 ## Success Criteria
 
-- [ ] `python execute.py --task WEB3-6` produces 3 output files
-- [ ] Context includes Jira description + Confluence pages
-- [ ] LLM response follows structured format
-- [ ] Uncertainties are clearly marked
-- [ ] Work plan has actionable steps with layers
+- [x] `python execute.py --task PROJ-123` produces output files
+- [x] Context includes Jira description + Confluence pages
+- [x] GitHub context included when GITHUB_TOKEN is set
+- [x] Confluence-first deduplication prevents duplicate info
+- [x] LLM response follows structured format
+- [x] Uncertainties are clearly marked
+- [x] Work plan has actionable steps with layers
 
 ---
 
@@ -452,8 +590,21 @@ openai>=1.0.0  # DeepSeek uses OpenAI-compatible API
 ## Environment Variables
 
 ```bash
-# .env (required for Stage 5)
-DEEPSEEK_API_KEY=sk-...  # DeepSeek API key
+# .env
+
+# Required
+JIRA_URL=https://your-domain.atlassian.net
+JIRA_EMAIL=your-email@example.com
+JIRA_API_TOKEN=your-jira-api-token
+
+CONFLUENCE_URL=https://your-domain.atlassian.net/wiki
+CONFLUENCE_EMAIL=your-email@example.com
+CONFLUENCE_API_TOKEN=your-confluence-api-token
+
+DEEPSEEK_API_KEY=sk-...  # Required for Stage 5 and Two-Stage Retrieval
+
+# Optional (Stage 3b: GitHub context)
+GITHUB_TOKEN=ghp_...  # GitHub Personal Access Token
 ```
 
 ## DeepSeek API Notes

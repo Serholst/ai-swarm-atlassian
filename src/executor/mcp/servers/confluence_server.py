@@ -198,21 +198,36 @@ class ConfluenceAPIClient:
         url = f"{self.base_url}/rest/api/space/{space_key}"
         return self._request("GET", url).json()
 
+    def get_page_ancestors(self, page_id: str) -> list[dict]:
+        """Get page ancestors (parent chain)."""
+        url = f"{self.base_url}/rest/api/content/{page_id}"
+        params = {"expand": "ancestors"}
+        result = self._request("GET", url, params=params).json()
+        return result.get("ancestors", [])
+
 
 # Initialize MCP Server
 app = Server("confluence-mcp-server")
 
-# Initialize Confluence client (from env vars)
+# Initialize Confluence client using shared Atlassian credentials
+# CONFLUENCE_URL should include /wiki suffix for Confluence Cloud
+# Fallback: append /wiki to ATLASSIAN_URL if CONFLUENCE_URL not set
 CONFLUENCE_URL = os.getenv("CONFLUENCE_URL", "")
-CONFLUENCE_EMAIL = os.getenv("CONFLUENCE_EMAIL", "")
-CONFLUENCE_API_TOKEN = os.getenv("CONFLUENCE_API_TOKEN", "")
+if not CONFLUENCE_URL:
+    ATLASSIAN_URL = os.getenv("ATLASSIAN_URL", "")
+    CONFLUENCE_URL = ATLASSIAN_URL.rstrip("/") + "/wiki"
 
-if not all([CONFLUENCE_URL, CONFLUENCE_EMAIL, CONFLUENCE_API_TOKEN]):
+ATLASSIAN_EMAIL = os.getenv("ATLASSIAN_EMAIL", "")
+ATLASSIAN_API_TOKEN = os.getenv("ATLASSIAN_API_TOKEN", "")
+
+if not all([CONFLUENCE_URL, ATLASSIAN_EMAIL, ATLASSIAN_API_TOKEN]):
     logger.error("Missing required environment variables for Confluence")
+    logger.error("Set CONFLUENCE_URL (or ATLASSIAN_URL), ATLASSIAN_EMAIL, ATLASSIAN_API_TOKEN")
     import sys
     sys.exit(1)
 
-confluence_client = ConfluenceAPIClient(CONFLUENCE_URL, CONFLUENCE_EMAIL, CONFLUENCE_API_TOKEN)
+logger.info(f"Confluence client initialized: {CONFLUENCE_URL} with account: {ATLASSIAN_EMAIL}")
+confluence_client = ConfluenceAPIClient(CONFLUENCE_URL, ATLASSIAN_EMAIL, ATLASSIAN_API_TOKEN)
 
 
 def _parse_confluence_page(page_data: dict) -> ConfluencePage:
@@ -232,7 +247,7 @@ def _parse_confluence_page(page_data: dict) -> ConfluencePage:
     labels_data = page_data.get("metadata", {}).get("labels", {}).get("results", [])
     labels = [label.get("name", "") for label in labels_data]
 
-    page_url = f"{CONFLUENCE_URL}{page_data.get('_links', {}).get('webui', '')}"
+    page_url = f"{ATLASSIAN_URL}{page_data.get('_links', {}).get('webui', '')}"
 
     return ConfluencePage(
         id=page_data["id"],
@@ -300,6 +315,17 @@ async def list_tools() -> list[Tool]:
                 "required": ["space_key", "project_name"],
             },
         ),
+        Tool(
+            name="confluence_get_page_ancestors",
+            description="Get the ancestor chain (parents) of a Confluence page",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "page_id": {"type": "string", "description": "Page ID"},
+                },
+                "required": ["page_id"],
+            },
+        ),
     ]
 
 
@@ -339,15 +365,19 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
         elif name == "confluence_search_pages":
             cql = arguments["cql"]
             limit = arguments.get("limit", 25)
+            logger.info(f"Searching Confluence with CQL: {cql}")
             results = confluence_client.search_pages(cql, limit=limit)
             pages = [_parse_confluence_page(d) for d in results]
+            logger.info(f"Found {len(pages)} pages")
 
             output_lines = [f"Found {len(pages)} pages:\n"]
             for page in pages:
+                # Include page ID explicitly for reliable parsing
                 output_lines.append(
-                    f"- **{page.title}** ({page.space.key}) - [View]({page.url})\n"
+                    f"- [ID:{page.id}] **{page.title}** ({page.space.key}) - [View]({page.url})\n"
                     f"  Version: {page.version}, Labels: {', '.join(page.labels)}"
                 )
+                logger.debug(f"  Page: id={page.id}, title={page.title}")
             return [TextContent(type="text", text="\n".join(output_lines))]
 
         elif name == "confluence_get_space_home":
@@ -396,6 +426,25 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
 {page.body}
 """
             return [TextContent(type="text", text=result)]
+
+        elif name == "confluence_get_page_ancestors":
+            page_id = arguments["page_id"]
+            ancestors = confluence_client.get_page_ancestors(page_id)
+
+            if not ancestors:
+                return [TextContent(type="text", text=f"No ancestors found for page {page_id} (may be root page)")]
+
+            output_lines = [f"Ancestors for page {page_id} (from root to parent):\n"]
+            for i, ancestor in enumerate(ancestors):
+                ancestor_id = ancestor.get("id", "")
+                ancestor_title = ancestor.get("title", "Unknown")
+                output_lines.append(f"{i+1}. [ID:{ancestor_id}] {ancestor_title}")
+
+            # Last ancestor is the direct parent
+            direct_parent = ancestors[-1]
+            output_lines.append(f"\nDirect parent: [ID:{direct_parent.get('id', '')}] {direct_parent.get('title', '')}")
+
+            return [TextContent(type="text", text="\n".join(output_lines))]
 
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]

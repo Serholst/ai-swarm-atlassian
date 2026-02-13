@@ -14,7 +14,6 @@ ENV/
 # Environment variables (contains secrets!)
 .env
 .env.local
-.env.example
 
 # IDE
 .vscode/
@@ -45,3 +44,6 @@ outputs/
 archive/
 *.tmp
 *.bak
+
+# User-specific SDLC config (contains real Confluence/Jira structure)
+config/sdlc_config.yaml

@@ -294,8 +294,8 @@ def main():
         results.append(("Data Cleaning", test_data_cleaning(mcp)))
         results.append(("SDLC Compliance", validate_sdlc_compliance(mcp, config.model_dump())))
 
-        # Test specific feature: WEB3-3
-        results.append(("WEB3-3 Feature", test_specific_issue(mcp, "WEB3-3")))
+        # Test specific feature (change to a real issue key in your Jira)
+        # results.append(("Feature Test", test_specific_issue(mcp, "PROJ-1")))
 
         # Optional: Test additional issue if provided
         if len(sys.argv) > 1:

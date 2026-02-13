@@ -7,6 +7,11 @@ Stages:
 3. Confluence Knowledge - extract_confluence_context() or get_refined_context()
 4. Data Aggregation - build_execution_context()
 5. LLM Execution - execute_llm_pipeline()
+5.5. Analysis & Decomposition - handle_analysis_decomposition()
+     - Creates blocking review Story
+     - Adds Technical Decomposition comment
+     - Adds Executor Rationale (CoT) comment
+     - Adds Clarification Questions comment (optional)
 """
 
 from .context_builder import (
@@ -34,6 +39,32 @@ from .llm_executor import (
     execute_llm_pipeline,
 )
 
+from .post_execution import (
+    handle_post_execution,
+    determine_outcome,
+    ExecutionOutcome,
+    TransitionResult,
+)
+
+from .decomposition import (
+    handle_analysis_decomposition,
+    parse_llm_response,
+    extract_stories,
+    extract_questions,
+    build_decomposition_comment,
+    build_cot_comment,
+    build_clarifications_comment,
+)
+
+from .validation import (
+    validate_work_plan,
+    validate_response_sections,
+    ValidationResult,
+    is_response_valid,
+    get_validation_errors,
+    get_validation_warnings,
+)
+
 __all__ = [
     # Stage 1
     "parse_issue_key",
@@ -55,4 +86,24 @@ __all__ = [
     "LLMResponse",
     "ExecutionOutput",
     "execute_llm_pipeline",
+    # Post-Execution (Jira Transitions)
+    "handle_post_execution",
+    "determine_outcome",
+    "ExecutionOutcome",
+    "TransitionResult",
+    # Analysis & Decomposition
+    "handle_analysis_decomposition",
+    "parse_llm_response",
+    "extract_stories",
+    "extract_questions",
+    "build_decomposition_comment",
+    "build_cot_comment",
+    "build_clarifications_comment",
+    # Validation
+    "validate_work_plan",
+    "validate_response_sections",
+    "ValidationResult",
+    "is_response_valid",
+    "get_validation_errors",
+    "get_validation_warnings",
 ]

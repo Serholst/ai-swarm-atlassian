@@ -22,8 +22,15 @@ from openai import OpenAI
 
 from ..models.execution_context import ExecutionContext
 from ..models.llm_metrics import LLMCallMetrics, ExecutionMetrics
-from ..prompts import SYSTEM_PROMPT, build_user_prompt
-from .validation import validate_work_plan, ValidationResult
+from ..prompts import SYSTEM_PROMPT, build_user_prompt, build_refinement_prompt
+from .validation import (
+    validate_work_plan,
+    validate_response_sections,
+    is_response_valid,
+    get_validation_errors,
+    get_validation_warnings,
+    ValidationResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -204,8 +211,28 @@ class LLMExecutor:
 
             duration_ms = int((time.time() - start_time) * 1000)
 
-            # Validate Work Plan section
-            validation_result = validate_work_plan(response.work_plan)
+            # Validate all response sections
+            section_results = validate_response_sections(
+                understanding=response.understanding,
+                concerns=response.concerns,
+                analysis=response.analysis,
+                work_plan=response.work_plan,
+                definition_of_ready=response.definition_of_ready,
+            )
+
+            # Aggregate into single ValidationResult for backward compat
+            all_errors = get_validation_errors(section_results)
+            all_warnings = get_validation_warnings(section_results)
+            wp_result = section_results.get("work_plan", ValidationResult(is_valid=True))
+
+            validation_result = ValidationResult(
+                is_valid=is_response_valid(section_results),
+                errors=all_errors,
+                warnings=all_warnings,
+                section_name="all_sections",
+                steps_found=wp_result.steps_found,
+                layers_found=wp_result.layers_found,
+            )
 
             # Record metrics for this call
             call_metrics = LLMCallMetrics(
@@ -269,6 +296,159 @@ class LLMExecutor:
         )
 
         logger.info(f"Stage 5 complete: {issue_key}")
+        return response, output
+
+    def execute_refinement(
+        self,
+        context: ExecutionContext,
+        feedback: str,
+        previous_plan: str,
+        version: int = 2,
+    ) -> tuple[LLMResponse, ExecutionOutput]:
+        """
+        Execute Stage 5 refinement: re-run LLM with feedback on previous plan.
+
+        Args:
+            context: ExecutionContext (loaded from context store)
+            feedback: Human feedback text
+            previous_plan: Previous work plan text
+            version: Refinement version (2, 3, ...)
+
+        Returns:
+            Tuple of (LLMResponse, ExecutionOutput)
+        """
+        issue_key = context.issue_key
+        logger.info(f"Stage 5 (Refinement v{version}): Executing LLM for {issue_key}")
+
+        # Initialize metrics
+        self.metrics = ExecutionMetrics(issue_key=issue_key)
+
+        # Create output directory
+        issue_dir = self.output_dir / issue_key
+        issue_dir.mkdir(parents=True, exist_ok=True)
+
+        # Build refinement prompt
+        user_prompt = build_refinement_prompt(context, feedback, previous_plan, version)
+
+        # Save prompt
+        version_suffix = f"_v{version}"
+        prompt_file = issue_dir / f"{issue_key}_prompt{version_suffix}.md"
+        prompt_file.write_text(
+            f"# Refinement Prompt v{version} for {issue_key}\n\n"
+            f"Generated: {datetime.now().isoformat()}\n"
+            f"Model: {self.model}\n\n---\n\n"
+            f"## System Prompt\n\n```\n{SYSTEM_PROMPT}\n```\n\n---\n\n"
+            f"## User Prompt\n\n{user_prompt}\n",
+            encoding="utf-8",
+        )
+
+        # Call LLM with same validation loop as execute()
+        response = None
+        validation_result: Optional[ValidationResult] = None
+        max_attempts = self.max_retries + 1
+
+        for attempt in range(1, max_attempts + 1):
+            start_time = time.time()
+
+            if attempt == 1:
+                logger.info(f"Calling DeepSeek API ({self.model}), refinement v{version}, attempt {attempt}...")
+                response = self._call_llm(user_prompt)
+            else:
+                logger.info(f"Retry {attempt - 1}/{self.max_retries}: Requesting Work Plan fix...")
+                response = self._call_llm_retry(
+                    original_response=response,
+                    validation_errors=validation_result.errors if validation_result else [],
+                    attempt=attempt,
+                )
+
+            duration_ms = int((time.time() - start_time) * 1000)
+
+            # Validate
+            section_results = validate_response_sections(
+                understanding=response.understanding,
+                concerns=response.concerns,
+                analysis=response.analysis,
+                work_plan=response.work_plan,
+                definition_of_ready=response.definition_of_ready,
+            )
+
+            all_errors = get_validation_errors(section_results)
+            all_warnings = get_validation_warnings(section_results)
+            wp_result = section_results.get("work_plan", ValidationResult(is_valid=True))
+
+            validation_result = ValidationResult(
+                is_valid=is_response_valid(section_results),
+                errors=all_errors,
+                warnings=all_warnings,
+                section_name="all_sections",
+                steps_found=wp_result.steps_found,
+                layers_found=wp_result.layers_found,
+            )
+
+            call_metrics = LLMCallMetrics(
+                tokens_in=response.tokens_in,
+                tokens_out=response.tokens_out,
+                tokens_total=response.tokens_used,
+                model=response.model,
+                call_purpose="refinement" if attempt == 1 else "retry",
+                attempt_number=attempt,
+                duration_ms=duration_ms,
+                validation_attempts=1,
+                validation_passed=validation_result.is_valid,
+                validation_errors=validation_result.errors.copy(),
+            )
+            self.metrics.add_call(call_metrics)
+
+            if validation_result.is_valid:
+                logger.info(f"Attempt {attempt}: Validation PASSED")
+                break
+            else:
+                logger.warning(f"Attempt {attempt}: Validation FAILED - {validation_result.errors}")
+                if attempt == max_attempts:
+                    self.metrics.max_retries_hit = True
+                    logger.error(f"Max retries reached for refinement v{version}")
+
+        # Save outputs with version suffix
+        reasoning_file = issue_dir / f"{issue_key}_reasoning{version_suffix}.md"
+        reasoning_file.write_text(
+            f"# Refined Reasoning v{version} for {issue_key}\n\n"
+            f"Generated: {datetime.now().isoformat()}\n"
+            f"Model: {response.model}\n"
+            f"Tokens Used: {response.tokens_used}\n\n---\n\n"
+            f"{response.raw_content}\n",
+            encoding="utf-8",
+        )
+
+        plan_file = issue_dir / f"{issue_key}_plan{version_suffix}.md"
+        summary = context.jira.summary if context.jira else issue_key
+        plan_file.write_text(
+            f"# Refined Work Plan v{version}: {issue_key}\n\n"
+            f"**Task:** {summary}\n"
+            f"**Generated:** {datetime.now().isoformat()}\n"
+            f"**Model:** {response.model}\n"
+            f"**Feedback:** {feedback[:200]}\n\n---\n\n"
+            f"## Steps\n\n{response.work_plan or '[Section not found]'}\n",
+            encoding="utf-8",
+        )
+
+        metrics_file = issue_dir / f"{issue_key}_metrics{version_suffix}.md"
+        metrics_file.write_text(
+            self.metrics.to_markdown() if self.metrics else "No metrics collected.",
+            encoding="utf-8",
+        )
+
+        # Context file not re-saved (same as original)
+        context_file = issue_dir / f"{issue_key}_context.md"
+
+        output = ExecutionOutput(
+            context_file=context_file,
+            prompt_file=prompt_file,
+            reasoning_file=reasoning_file,
+            plan_file=plan_file,
+            metrics_file=metrics_file,
+        )
+
+        logger.info(f"Refinement v{version} complete: {issue_key}")
         return response, output
 
     def _call_llm(self, user_prompt: str) -> LLMResponse:

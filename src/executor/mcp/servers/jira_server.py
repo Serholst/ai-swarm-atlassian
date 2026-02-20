@@ -281,6 +281,65 @@ class MarkdownToADF:
 
         return result if result else [{"type": "text", "text": text}]
 
+    @classmethod
+    def expand_block(cls, title: str, body_markdown: str) -> dict:
+        """Create an ADF expand (collapsible) block.
+
+        Args:
+            title: The expand block title (visible when collapsed)
+            body_markdown: Markdown content inside the expand block
+        """
+        inner_doc = cls.convert(body_markdown)
+        return {
+            "type": "expand",
+            "attrs": {"title": title},
+            "content": inner_doc.get("content", []),
+        }
+
+    @classmethod
+    def table(cls, headers: list[str], rows: list[list[str]]) -> dict:
+        """Create an ADF table node with header row and data rows.
+
+        Args:
+            headers: List of header cell strings
+            rows: List of rows, each row is a list of cell strings
+        """
+        header_row = {
+            "type": "tableRow",
+            "content": [
+                {
+                    "type": "tableHeader",
+                    "attrs": {},
+                    "content": [cls._paragraph(h)],
+                }
+                for h in headers
+            ],
+        }
+
+        data_rows = [
+            {
+                "type": "tableRow",
+                "content": [
+                    {
+                        "type": "tableCell",
+                        "attrs": {},
+                        "content": [cls._paragraph(cell)],
+                    }
+                    for cell in row
+                ],
+            }
+            for row in rows
+        ]
+
+        return {
+            "type": "table",
+            "attrs": {
+                "isNumberColumnEnabled": False,
+                "layout": "default",
+            },
+            "content": [header_row] + data_rows,
+        }
+
 
 class JiraAPIClient:
     """Jira REST API client with cleaning and rate limiting."""
@@ -361,6 +420,28 @@ class JiraAPIClient:
         adf_body = MarkdownToADF.convert(body)
         payload = {"body": adf_body}
         return self._request("POST", url, json=payload).json()
+
+    def add_comment_adf(self, issue_key: str, adf_body: dict) -> dict:
+        """Add a comment to an issue using pre-built ADF content.
+
+        Args:
+            issue_key: Issue key (e.g., AI-123)
+            adf_body: Pre-built ADF document dict
+        """
+        url = f"{self.base_url}/rest/api/3/issue/{issue_key}/comment"
+        payload = {"body": adf_body}
+        return self._request("POST", url, json=payload).json()
+
+    def update_description(self, issue_key: str, adf_body: dict) -> None:
+        """Update the description of a Jira issue with pre-built ADF content.
+
+        Args:
+            issue_key: Issue key (e.g., AI-123)
+            adf_body: ADF document (already built, not markdown)
+        """
+        url = f"{self.base_url}/rest/api/3/issue/{issue_key}"
+        payload = {"fields": {"description": adf_body}}
+        self._request("PUT", url, json=payload)
 
     def transition_issue(self, issue_key: str, target_status: str) -> None:
         """
@@ -516,6 +597,14 @@ def extract_adf_text(adf: dict) -> str:
             lines = text.strip().split("\n")
             return "\n".join("> " + line for line in lines) + "\n"
 
+        if node_type == "expand":
+            title = node.get("attrs", {}).get("title", "")
+            text = "".join(traverse(child) for child in content)
+            return f"{title}\n{text}\n"
+
+        if node_type == "rule":
+            return "---\n"
+
         # Handle inlineCard (smart links) - extract URL
         if node_type == "inlineCard":
             url = node.get("attrs", {}).get("url", "")
@@ -538,28 +627,29 @@ def extract_adf_text(adf: dict) -> str:
     return ""
 
 
-# Initialize MCP Server
-app = Server("jira-mcp-server")
-
-# Initialize Jira client using shared Atlassian credentials
-ATLASSIAN_URL = os.getenv("ATLASSIAN_URL", "")
-ATLASSIAN_EMAIL = os.getenv("ATLASSIAN_EMAIL", "")
-ATLASSIAN_API_TOKEN = os.getenv("ATLASSIAN_API_TOKEN", "")
-
 # Custom field IDs (instance-specific — configure via env vars or .env)
 # Find your field IDs: https://your-domain.atlassian.net/rest/api/3/field
 JIRA_PROJECT_DROPDOWN_FIELD = os.getenv("JIRA_PROJECT_DROPDOWN_FIELD", "customfield_10072")
 JIRA_PROJECT_TEXT_FIELD = os.getenv("JIRA_PROJECT_TEXT_FIELD", "customfield_10073")
 JIRA_PROJECT_LINK_FIELD = os.getenv("JIRA_PROJECT_LINK_FIELD", "customfield_10107")
 
-if not all([ATLASSIAN_URL, ATLASSIAN_EMAIL, ATLASSIAN_API_TOKEN]):
-    logger.error("Missing required environment variables for Jira")
-    logger.error("Set ATLASSIAN_URL, ATLASSIAN_EMAIL, ATLASSIAN_API_TOKEN")
-    import sys
-    sys.exit(1)
+# Initialize MCP Server and Jira client.
+# When imported for utility classes (MarkdownToADF, extract_adf_text), env vars
+# may not be present. The server/client are only needed when running as MCP server.
+ATLASSIAN_URL = os.getenv("ATLASSIAN_URL", "")
+ATLASSIAN_EMAIL = os.getenv("ATLASSIAN_EMAIL", "")
+ATLASSIAN_API_TOKEN = os.getenv("ATLASSIAN_API_TOKEN", "")
 
-logger.info(f"Jira client initialized with account: {ATLASSIAN_EMAIL}")
-jira_client = JiraAPIClient(ATLASSIAN_URL, ATLASSIAN_EMAIL, ATLASSIAN_API_TOKEN)
+_server_initialized = False
+
+if all([ATLASSIAN_URL, ATLASSIAN_EMAIL, ATLASSIAN_API_TOKEN]):
+    app = Server("jira-mcp-server")
+    jira_client = JiraAPIClient(ATLASSIAN_URL, ATLASSIAN_EMAIL, ATLASSIAN_API_TOKEN)
+    logger.info(f"Jira client initialized with account: {ATLASSIAN_EMAIL}")
+    _server_initialized = True
+else:
+    app = Server("jira-mcp-server")
+    jira_client = None  # type: ignore[assignment]
 
 
 def _parse_jira_user(user_data: dict | None) -> JiraUser | None:
@@ -706,6 +796,18 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="jira_add_comment_adf",
+            description="Add a comment to a Jira issue using pre-built ADF (JSON)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "issue_key": {"type": "string", "description": "Issue key"},
+                    "adf_body": {"type": "object", "description": "ADF document JSON"},
+                },
+                "required": ["issue_key", "adf_body"],
+            },
+        ),
+        Tool(
             name="jira_transition_issue",
             description="Change issue status/transition",
             inputSchema={
@@ -730,6 +832,18 @@ async def list_tools() -> list[Tool]:
                     "parent_key": {"type": "string", "description": "Parent issue key (for Stories)"},
                 },
                 "required": ["project_key", "issue_type", "summary"],
+            },
+        ),
+        Tool(
+            name="jira_update_description",
+            description="Update a Jira issue description with ADF content (pre-built JSON)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "issue_key": {"type": "string", "description": "Issue key (e.g., AI-123)"},
+                    "adf_body": {"type": "object", "description": "ADF document JSON"},
+                },
+                "required": ["issue_key", "adf_body"],
             },
         ),
         Tool(
@@ -765,6 +879,7 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
 **Project Folder:** {issue.project_folder or 'None'}
 **Project Link:** {issue.project_link or 'None'}
 **Assignee:** {issue.assignee.display_name if issue.assignee else 'Unassigned'}
+**Assignee Account ID:** {issue.assignee.account_id if issue.assignee else 'None'}
 **Labels:** {', '.join(issue.labels) if issue.labels else 'None'}
 
 ## Description
@@ -801,10 +916,11 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
             output_lines = [f"Comments for {issue_key}:\n"]
             for comment_data in comments_data:
                 author = comment_data.get("author", {}).get("displayName", "Unknown")
+                account_id = comment_data.get("author", {}).get("accountId", "")
                 created = comment_data.get("created", "")
                 body = comment_data.get("body", {})
                 body_text = extract_adf_text(body) if isinstance(body, dict) else str(body)
-                output_lines.append(f"\n### {author} - {created}\n\n{body_text}\n")
+                output_lines.append(f"\n### {author} ({account_id}) - {created}\n\n{body_text}\n")
 
             return [TextContent(type="text", text="\n".join(output_lines))]
 
@@ -813,6 +929,12 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
             body = arguments["body"]
             jira_client.add_comment(issue_key, body)
             return [TextContent(type="text", text=f"Comment added to {issue_key}")]
+
+        elif name == "jira_add_comment_adf":
+            issue_key = arguments["issue_key"]
+            adf_body = arguments["adf_body"]
+            jira_client.add_comment_adf(issue_key, adf_body)
+            return [TextContent(type="text", text=f"ADF comment added to {issue_key}")]
 
         elif name == "jira_transition_issue":
             issue_key = arguments["issue_key"]
@@ -830,6 +952,12 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
             result = jira_client.create_issue(project_key, issue_type, summary, description, parent_key)
             new_key = result.get("key", "")
             return [TextContent(type="text", text=f"Created issue: {new_key}")]
+
+        elif name == "jira_update_description":
+            issue_key = arguments["issue_key"]
+            adf_body = arguments["adf_body"]
+            jira_client.update_description(issue_key, adf_body)
+            return [TextContent(type="text", text=f"Description updated for {issue_key}")]
 
         elif name == "jira_link_issues":
             from_key = arguments["from_key"]
@@ -849,6 +977,10 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
 
 async def main():
     """Run the MCP server."""
+    if not _server_initialized:
+        logger.error("Missing required environment variables for Jira")
+        logger.error("Set ATLASSIAN_URL, ATLASSIAN_EMAIL, ATLASSIAN_API_TOKEN")
+        sys.exit(1)
     async with stdio_server() as (read_stream, write_stream):
         await app.run(read_stream, write_stream, app.create_initialization_options())
 

@@ -212,10 +212,10 @@ app = Server("confluence-mcp-server")
 # Initialize Confluence client using shared Atlassian credentials
 # CONFLUENCE_URL should include /wiki suffix for Confluence Cloud
 # Fallback: append /wiki to ATLASSIAN_URL if CONFLUENCE_URL not set
+ATLASSIAN_URL = os.getenv("ATLASSIAN_URL", "").rstrip("/")
 CONFLUENCE_URL = os.getenv("CONFLUENCE_URL", "")
 if not CONFLUENCE_URL:
-    ATLASSIAN_URL = os.getenv("ATLASSIAN_URL", "")
-    CONFLUENCE_URL = ATLASSIAN_URL.rstrip("/") + "/wiki"
+    CONFLUENCE_URL = ATLASSIAN_URL + "/wiki"
 
 ATLASSIAN_EMAIL = os.getenv("ATLASSIAN_EMAIL", "")
 ATLASSIAN_API_TOKEN = os.getenv("ATLASSIAN_API_TOKEN", "")

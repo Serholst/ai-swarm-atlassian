@@ -15,12 +15,13 @@ from typing import Optional, Union, TYPE_CHECKING
 from enum import Enum
 
 if TYPE_CHECKING:
-    from .github_models import GitHubContext
+    from .github_models import GitHubContext  # noqa: F401
 
 
 class ProjectStatus(Enum):
     """Project status based on documentation state."""
-    EXISTING = "existing"      # Has Passport + Architecture
+    EXISTING = "existing"      # Has Passport + Architecture with content
+    INCOMPLETE = "incomplete"  # Pages exist but are empty or lack content
     NEW_PROJECT = "new"        # Folder exists but no mandatory docs
     NOT_FOUND = "not_found"    # Folder doesn't exist
     BRAND_NEW = "brand_new"    # No project_link AND no project_folder (greenfield)
@@ -55,6 +56,7 @@ class JiraContext:
 
     # People
     assignee: Optional[str] = None
+    assignee_account_id: Optional[str] = None
     reporter: Optional[str] = None
 
     # Hierarchy
@@ -236,6 +238,16 @@ class RefinedConfluenceContext:
 
 
 @dataclass
+class ConfluenceTemplate:
+    """A Confluence template page retrieved from the Templates folder."""
+    doc_type: str  # e.g., "Project Passport", "Logical Architecture"
+    title: str
+    content: str  # Full page content (markdown)
+    page_id: str = ""
+    url: str = ""
+
+
+@dataclass
 class ExecutionContext:
     """Stage 4 output: Unified context for LLM execution."""
 
@@ -248,6 +260,9 @@ class ExecutionContext:
     confluence: Optional[ConfluenceContext] = None
     refined_confluence: Optional[RefinedConfluenceContext] = None  # Two-Stage Retrieval
     github: Optional["GitHubContext"] = None  # GitHub context (Confluence-filtered)
+
+    # Confluence templates (from Templates/Patterns folder)
+    confluence_templates: list[ConfluenceTemplate] = field(default_factory=list)
 
     # Aggregation status
     errors: list[str] = field(default_factory=list)
@@ -309,25 +324,49 @@ class ExecutionContext:
             sections.append(f"**Status:** {self.refined_confluence.project_status.value}")
             sections.append("")
 
-            # Brand-new project signal (greenfield)
-            if self.refined_confluence.project_status == ProjectStatus.BRAND_NEW:
-                sections.append("### BRAND NEW PROJECT")
+            # Documentation gaps signal (BRAND_NEW, NEW_PROJECT, or INCOMPLETE)
+            status = self.refined_confluence.project_status
+            if status in (ProjectStatus.BRAND_NEW, ProjectStatus.NEW_PROJECT, ProjectStatus.INCOMPLETE):
+                if status == ProjectStatus.BRAND_NEW:
+                    sections.append("### BRAND NEW PROJECT")
+                    sections.append("")
+                    sections.append("**IMPORTANT:** This is a greenfield project with no existing Confluence documentation.")
+                elif status == ProjectStatus.NEW_PROJECT:
+                    sections.append("### NEW PROJECT - DOCUMENTATION MISSING")
+                    sections.append("")
+                    sections.append("**IMPORTANT:** The project folder exists in Confluence but mandatory documentation pages are missing.")
+                elif status == ProjectStatus.INCOMPLETE:
+                    sections.append("### INCOMPLETE PROJECT DOCUMENTATION")
+                    sections.append("")
+                    sections.append("**IMPORTANT:** Some mandatory documentation pages exist but are empty or incomplete.")
+
                 sections.append("")
-                sections.append("**IMPORTANT:** This is a greenfield project with no existing Confluence documentation.")
+                if self.refined_confluence.missing_critical_data:
+                    sections.append("**Documentation gaps:**")
+                    for item in self.refined_confluence.missing_critical_data:
+                        sections.append(f"- {item}")
+                    sections.append("")
+
+                sections.append("Your work plan MUST include steps to create or fill these pages.")
+
+                # Use templates if available, otherwise fall back to defaults
+                if self.confluence_templates:
+                    sections.append("")
+                    sections.append("**Refer to the TEMPLATE COMPLIANCE section below for exact page structures.**")
+                else:
+                    sections.append("1. **Project Passport** page with sections:")
+                    sections.append("   - Identity & Ownership")
+                    sections.append("   - Technology Stack")
+                    sections.append("   - Repositories")
+                    sections.append("   - Environments")
+                    sections.append("2. **Logical Architecture** page with sections:")
+                    sections.append("   - Component Diagram")
+                    sections.append("   - Data Flow")
+                    sections.append("   - Contracts & Interfaces")
+                    sections.append("   - Constraints")
+
                 sections.append("")
-                sections.append("Your work plan MUST include steps to create:")
-                sections.append("1. **Project Passport** page with sections:")
-                sections.append("   - Identity & Ownership")
-                sections.append("   - Technology Stack")
-                sections.append("   - Repositories")
-                sections.append("   - Environments")
-                sections.append("2. **Logical Architecture** page with sections:")
-                sections.append("   - Component Diagram")
-                sections.append("   - Data Flow")
-                sections.append("   - Contracts & Interfaces")
-                sections.append("   - Constraints")
-                sections.append("")
-                sections.append("Use `[DOCS]` layer for documentation creation steps.")
+                sections.append("Use `[DOCS]` layer for documentation creation/update steps.")
                 sections.append("")
 
             # Core documents (Mandatory Path)
@@ -351,15 +390,6 @@ class ExecutionContext:
                     sections.append("")
                     sections.append(doc.content)
                     sections.append("")
-
-            # Missing critical data (informational)
-            if self.refined_confluence.missing_critical_data:
-                sections.append("### New Project Signal")
-                sections.append("")
-                sections.append("The following critical documents are missing (new project):")
-                for item in self.refined_confluence.missing_critical_data:
-                    sections.append(f"- {item}")
-                sections.append("")
 
             # Retrieval errors
             if self.refined_confluence.retrieval_errors:
@@ -426,11 +456,14 @@ class ExecutionContext:
         return "\n".join(sections)
 
     def is_valid(self) -> bool:
-        """Check if context has minimum required data."""
+        """Check if context has minimum required data.
+
+        Only summary is required — description may be empty for backlog
+        items that Phase 0 is designed to analyze.
+        """
         return (
             self.jira is not None
-            and self.jira.summary
-            and self.jira.description
+            and bool(self.jira.summary)
         )
 
     def is_new_project(self) -> bool:

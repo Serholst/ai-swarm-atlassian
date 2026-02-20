@@ -17,6 +17,7 @@ from ..mcp.client import MCPClientManager
 from ..models.execution_context import (
     JiraContext,
     ConfluenceContext,
+    ConfluenceTemplate,
     ExecutionContext,
     ProjectStatus,
     ContextLocationError,
@@ -24,6 +25,9 @@ from ..models.execution_context import (
     RefinedConfluenceContext,
     SelectionLog,
 )
+
+# Minimum content length to consider a page non-empty (characters)
+MIN_PAGE_CONTENT_LENGTH = 50
 from ..models.github_models import (
     GitHubContext,
     RepoStatus,
@@ -117,6 +121,31 @@ def parse_issue_key(task_input: str) -> str:
 
 
 # =============================================================================
+# Stage 1.5: Issue Status Check (lightweight, before full enrichment)
+# =============================================================================
+
+def get_issue_status(mcp: MCPClientManager, issue_key: str) -> str:
+    """
+    Lightweight status check — fetches only the Jira issue status.
+
+    Used by the unified --task entry point to route to the correct phase
+    (Phase 0 for Backlog, Stages 1-5 for AI-TO-DO, etc.).
+
+    Args:
+        mcp: MCP client manager
+        issue_key: Jira issue key
+
+    Returns:
+        Status string (e.g., "Backlog", "AI To Do", "Human Plan Review")
+    """
+    raw_response = mcp.jira_get_issue(issue_key)
+    match = re.search(r"\*\*Status:\*\*\s*(.+?)(?:\n|$)", raw_response, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    raise ValueError(f"Could not extract status from Jira response for {issue_key}")
+
+
+# =============================================================================
 # Stage 2: Jira Enrichment - Extract context from Jira
 # =============================================================================
 
@@ -197,6 +226,9 @@ def _parse_jira_response(issue_key: str, response: str) -> JiraContext:
     assignee = extract_field(r"\*\*Assignee:\*\*\s*(.+?)(?:\n|$)", response)
     if assignee.lower() == "unassigned":
         assignee = None
+    assignee_account_id = extract_field(r"\*\*Assignee Account ID:\*\*\s*(.+?)(?:\n|$)", response)
+    if assignee_account_id.lower() == "none":
+        assignee_account_id = None
 
     # Extract project: "Name (KEY)"
     project_match = re.search(r"\*\*Project:\*\*\s*(.+?)\s*\(([A-Z0-9]+)\)", response)
@@ -244,6 +276,7 @@ def _parse_jira_response(issue_key: str, response: str) -> JiraContext:
         components=[],  # Not in current response format
         labels=labels,
         assignee=assignee,
+        assignee_account_id=assignee_account_id,
         reporter=None,  # Not in current response format
         parent_key=parent_key,
         subtasks=subtasks,
@@ -261,11 +294,11 @@ def _parse_jira_comments(response: str) -> list[dict]:
     Response format from jira_server.py:
     Comments for KEY:
 
-    ### Author Name - 2024-01-15T10:30:00.000+0000
+    ### Author Name (accountId) - 2024-01-15T10:30:00.000+0000
 
     Comment body text here
 
-    ### Another Author - 2024-01-16T14:00:00.000+0000
+    ### Another Author (accountId) - 2024-01-16T14:00:00.000+0000
 
     Another comment body
     """
@@ -282,21 +315,41 @@ def _parse_jira_comments(response: str) -> list[dict]:
         if not lines:
             continue
 
-        # First line: "Author Name - 2024-01-15T10:30:00.000+0000"
+        # First line: "Author Name (accountId) - 2024-01-15T10:30:00.000+0000"
         header = lines[0]
-        header_match = re.match(r"(.+?)\s*-\s*(\d{4}-\d{2}-\d{2}.*?)$", header)
+        # Try new format with account_id: "Author (accountId) - timestamp"
+        # Use greedy (.+) for author to match the LAST parenthesized group
+        # before the " - timestamp", handling names like "John (Contractor)"
+        header_match = re.match(
+            r"(.+)\s*\(([^)]*)\)\s*-\s*(\d{4}-\d{2}-\d{2}.*?)$", header
+        )
 
         if header_match:
             author = header_match.group(1).strip()
-            created = header_match.group(2).strip()
-            # Rest is the body
+            account_id = header_match.group(2).strip()
+            created = header_match.group(3).strip()
             body = "\n".join(lines[1:]).strip()
 
             comments.append({
                 "author": author,
+                "account_id": account_id,
                 "created": created,
                 "body": body,
             })
+        else:
+            # Fallback: legacy format without account_id "Author - timestamp"
+            legacy_match = re.match(r"(.+?)\s*-\s*(\d{4}-\d{2}-\d{2}.*?)$", header)
+            if legacy_match:
+                author = legacy_match.group(1).strip()
+                created = legacy_match.group(2).strip()
+                body = "\n".join(lines[1:]).strip()
+
+                comments.append({
+                    "author": author,
+                    "account_id": "",
+                    "created": created,
+                    "body": body,
+                })
 
     return comments
 
@@ -539,7 +592,11 @@ def get_refined_context(
         "Logical Architecture": ["Logical Architecture", "System Architecture", "Архитектура"],
     }
 
-    found_mandatory = {"Project Passport": False, "Logical Architecture": False}
+    # Track: "found" (has content), "empty" (page exists but no content), False (not found)
+    found_mandatory: dict[str, str | bool] = {
+        "Project Passport": False,
+        "Logical Architecture": False,
+    }
 
     for doc_type, keywords in mandatory_docs.items():
         for keyword in keywords:
@@ -560,82 +617,99 @@ def get_refined_context(
                             content=content,
                             id=page["id"],
                         ))
-                        found_mandatory[doc_type] = True
-                        logger.info(f"Phase 2: Found {doc_type} - '{page['title']}'")
+
+                        # Detect empty pages (exist but have no meaningful content)
+                        if len(content.strip()) < MIN_PAGE_CONTENT_LENGTH:
+                            found_mandatory[doc_type] = "empty"
+                            logger.info(f"Phase 2: Found {doc_type} - '{page['title']}' (EMPTY - {len(content.strip())} chars)")
+                        else:
+                            found_mandatory[doc_type] = "found"
+                            logger.info(f"Phase 2: Found {doc_type} - '{page['title']}'")
                         break
 
             except Exception as e:
                 logger.warning(f"Phase 2: Error searching '{keyword}': {e}")
 
-    # Determine project status
-    if not found_mandatory["Project Passport"] and not found_mandatory["Logical Architecture"]:
+    # Determine project status based on mandatory docs state
+    all_missing = all(v is False for v in found_mandatory.values())
+    any_empty = any(v == "empty" for v in found_mandatory.values())
+    all_found = all(v == "found" for v in found_mandatory.values())
+
+    if all_missing:
         context.project_status = ProjectStatus.NEW_PROJECT
-        context.missing_critical_data = ["Project Passport", "Logical Architecture"]
+        context.missing_critical_data = [
+            f"{doc_type} (needs creation)" for doc_type in found_mandatory
+        ]
         logger.info("Phase 2: NEW PROJECT detected (no mandatory docs)")
-    elif not found_mandatory["Project Passport"]:
-        context.missing_critical_data.append("Project Passport")
-    elif not found_mandatory["Logical Architecture"]:
-        context.missing_critical_data.append("Logical Architecture")
+    elif any_empty or not all_found:
+        context.project_status = ProjectStatus.INCOMPLETE
+        for doc_type, status in found_mandatory.items():
+            if status is False:
+                context.missing_critical_data.append(f"{doc_type} (needs creation)")
+            elif status == "empty":
+                context.missing_critical_data.append(f"{doc_type} (exists but empty - needs content)")
+        logger.info(f"Phase 2: INCOMPLETE project detected - {context.missing_critical_data}")
+    else:
+        logger.info("Phase 2: All mandatory docs found with content")
 
     # =========================================================================
     # Phase 3: Discovery Path (LLM Filter via DeepSeek)
+    # Always run Phase 3 - even for new/incomplete projects there may be
+    # useful docs in the folder (meeting notes, specs, etc.)
     # =========================================================================
-    if context.project_status == ProjectStatus.NEW_PROJECT:
-        logger.info("Phase 3: Skipped (new project)")
-    else:
-        # Step 3.1: Broad CQL search
-        keywords_from_jira = _extract_search_keywords(jira_text)
-        cql = f'ancestor = {folder_id} AND (text ~ "{keywords_from_jira}")'
+    # Step 3.1: Broad CQL search
+    keywords_from_jira = _extract_search_keywords(jira_text)
+    cql = f'ancestor = {folder_id} AND (text ~ "{keywords_from_jira}")'
 
+    try:
+        search_results = mcp.confluence_search_pages(cql, limit=20)
+        candidates = _parse_search_results_with_excerpts(search_results)
+
+        # Filter out already-fetched core docs
+        core_ids = {doc.id for doc in context.core_documents}
+        candidates = [c for c in candidates if c["id"] not in core_ids]
+
+        logger.info(f"Phase 3.1: {len(candidates)} candidates after filtering")
+
+    except Exception as e:
+        logger.warning(f"Phase 3.1: Search failed - {e}")
+        candidates = []
+
+    if candidates:
+        # Step 3.2: LLM Filtering (DeepSeek)
         try:
-            search_results = mcp.confluence_search_pages(cql, limit=20)
-            candidates = _parse_search_results_with_excerpts(search_results)
+            selection_log = _llm_filter_documents_deepseek(
+                llm_client=llm_client,
+                jira_summary=jira_text.split("\n")[0],
+                jira_description=jira_text,
+                candidates=candidates,
+            )
+            context.selection_log = selection_log
+            selected_ids = selection_log.selected_ids
+            logger.info(f"Phase 3.2: DeepSeek selected {len(selected_ids)} IDs")
 
-            # Filter out already-fetched core docs
-            core_ids = {doc.id for doc in context.core_documents}
-            candidates = [c for c in candidates if c["id"] not in core_ids]
+            # Step 3.3: Fetch selected documents
+            for page_id in selected_ids:
+                try:
+                    full_page = mcp.confluence_get_page(page_id=page_id)
+                    content = _extract_text_content(full_page)
 
-            logger.info(f"Phase 3.1: {len(candidates)} candidates after filtering")
+                    candidate = next((c for c in candidates if c["id"] == page_id), {})
+
+                    context.supporting_documents.append(RefinedDocument(
+                        title=candidate.get("title", "Unknown"),
+                        url=candidate.get("url", ""),
+                        content=content,
+                        id=page_id,
+                    ))
+                except Exception as e:
+                    logger.warning(f"Phase 3.3: Failed to fetch {page_id}: {e}")
 
         except Exception as e:
-            logger.warning(f"Phase 3.1: Search failed - {e}")
-            candidates = []
-
-        if candidates:
-            # Step 3.2: LLM Filtering (DeepSeek)
-            try:
-                selection_log = _llm_filter_documents_deepseek(
-                    llm_client=llm_client,
-                    jira_summary=jira_text.split("\n")[0],
-                    jira_description=jira_text,
-                    candidates=candidates,
-                )
-                context.selection_log = selection_log
-                selected_ids = selection_log.selected_ids
-                logger.info(f"Phase 3.2: DeepSeek selected {len(selected_ids)} IDs")
-
-                # Step 3.3: Fetch selected documents
-                for page_id in selected_ids:
-                    try:
-                        full_page = mcp.confluence_get_page(page_id=page_id)
-                        content = _extract_text_content(full_page)
-
-                        candidate = next((c for c in candidates if c["id"] == page_id), {})
-
-                        context.supporting_documents.append(RefinedDocument(
-                            title=candidate.get("title", "Unknown"),
-                            url=candidate.get("url", ""),
-                            content=content,
-                            id=page_id,
-                        ))
-                    except Exception as e:
-                        logger.warning(f"Phase 3.3: Failed to fetch {page_id}: {e}")
-
-            except Exception as e:
-                logger.warning(f"Phase 3.2: DeepSeek filtering failed - {e}")
-                context.retrieval_errors.append(f"LLM filtering failed: {e}")
-        else:
-            logger.info("Phase 3: No candidates to filter")
+            logger.warning(f"Phase 3.2: DeepSeek filtering failed - {e}")
+            context.retrieval_errors.append(f"LLM filtering failed: {e}")
+    else:
+        logger.info("Phase 3: No candidates to filter")
 
     # =========================================================================
     # Phase 4: Output Assembly
@@ -1488,6 +1562,234 @@ def _parse_code_search_results(
 
 
 # =============================================================================
+# Phase 0.5: Assignee Feedback Extraction
+# =============================================================================
+
+def has_existing_phase0_analysis(context: ExecutionContext) -> bool:
+    """
+    Check if the Jira description already contains a Phase 0 analysis.
+
+    Detects the "Phase 0: Requirements Analysis" header that Phase 0
+    writes to the Jira description.
+
+    Args:
+        context: ExecutionContext with Jira data
+
+    Returns:
+        True if Phase 0 analysis exists in the description
+    """
+    if not context.jira or not context.jira.description:
+        return False
+    return "Phase 0: Requirements Analysis" in context.jira.description
+
+
+def extract_assignee_feedback(
+    mcp: MCPClientManager,
+    issue_key: str,
+    assignee_account_id: str | None,
+    phase0_timestamp: str | None = None,
+) -> list[dict]:
+    """
+    Extract comments authored by the task assignee, posted after Phase 0.
+
+    Filters ALL comments to only those where:
+    1. The author's account_id matches the assignee's account_id
+    2. The comment was posted after the Phase 0 analysis (if timestamp given)
+    3. The comment is not an AI-generated comment (no "AI Executor" headers)
+
+    Args:
+        mcp: MCP client manager (started)
+        issue_key: Jira issue key
+        assignee_account_id: The assignee's Atlassian accountId
+        phase0_timestamp: ISO timestamp of Phase 0 execution (optional filter)
+
+    Returns:
+        List of comment dicts [{author, account_id, created, body}] from assignee only
+    """
+    if not assignee_account_id:
+        logger.warning("Phase 0.5: No assignee account ID — cannot filter comments")
+        return []
+
+    try:
+        comments_response = mcp.jira_get_comments(issue_key)
+        all_comments = _parse_jira_comments(comments_response)
+    except Exception as e:
+        logger.error(f"Phase 0.5: Failed to get comments: {e}")
+        return []
+
+    assignee_comments = []
+    for comment in all_comments:
+        # Filter 1: Must be from the assignee
+        if comment.get("account_id") != assignee_account_id:
+            continue
+
+        # Filter 2: Skip AI-generated comments (bot artifacts)
+        # Use line-start matching to avoid false positives when assignee
+        # quotes or discusses these markers in their feedback
+        body = comment.get("body", "")
+        ai_markers = [
+            r"^## AI Executor",
+            r"^## Technical Decomposition",
+            r"^## Phase 0",
+            r"^\{panel:title=Executor Rationale",
+        ]
+        if any(re.search(pattern, body, re.MULTILINE) for pattern in ai_markers):
+            continue
+
+        # Filter 3: Must be after Phase 0 timestamp (if provided)
+        if phase0_timestamp:
+            comment_ts = comment.get("created", "")
+            if comment_ts and comment_ts < phase0_timestamp:
+                continue
+
+        assignee_comments.append(comment)
+
+    logger.info(
+        f"Phase 0.5: Found {len(assignee_comments)} assignee comments "
+        f"(filtered from {len(all_comments)} total)"
+    )
+    return assignee_comments
+
+
+# =============================================================================
+# Template Compliance: Confluence Templates Retrieval
+# =============================================================================
+
+# Keywords to locate the Templates folder
+_TEMPLATES_FOLDER_KEYWORDS = ["Templates", "Patterns", "Шаблоны"]
+
+# Mapping of document types to template search keywords
+_TEMPLATE_DOC_TYPES = {
+    "Project Passport": ["Project Passport", "Passport", "Паспорт проекта"],
+    "Logical Architecture": ["Logical Architecture", "Architecture", "Архитектура"],
+}
+
+
+def retrieve_confluence_templates(
+    mcp: MCPClientManager,
+    space_key: str,
+    hub_space: str | None = None,
+) -> list[ConfluenceTemplate]:
+    """
+    Retrieve documentation templates from the Confluence Templates folder.
+
+    Searches for a "Templates" (or "Patterns") folder in the project space first,
+    then falls back to a hub space if configured.
+
+    Args:
+        mcp: MCP client manager
+        space_key: Confluence space key (project-specific)
+        hub_space: Optional hub/root space key to search as fallback
+
+    Returns:
+        List of ConfluenceTemplate objects (empty if no templates found)
+    """
+    spaces = [space_key]
+    if hub_space and hub_space != space_key:
+        spaces.append(hub_space)
+
+    logger.info(f"Template Compliance: Searching for Templates folder in spaces {spaces}")
+    templates: list[ConfluenceTemplate] = []
+
+    # Step 1: Find the Templates folder (project space first, then hub)
+    templates_folder_id = _find_templates_folder(mcp, spaces)
+    if not templates_folder_id:
+        logger.info("Template Compliance: No Templates folder found — using default layout")
+        return templates
+
+    logger.info(f"Template Compliance: Found Templates folder (ID: {templates_folder_id})")
+
+    # Step 2: Search for template pages within the Templates folder
+    for doc_type, keywords in _TEMPLATE_DOC_TYPES.items():
+        template = _find_template_page(mcp, templates_folder_id, doc_type, keywords)
+        if template:
+            templates.append(template)
+            logger.info(f"Template Compliance: Found template '{template.title}' for {doc_type}")
+        else:
+            logger.info(f"Template Compliance: No template found for {doc_type}")
+
+    logger.info(f"Template Compliance: Retrieved {len(templates)} templates")
+    return templates
+
+
+def _find_templates_folder(mcp: MCPClientManager, space_keys: list[str]) -> str | None:
+    """
+    Search for the Templates/Patterns folder across multiple Confluence spaces.
+
+    Searches project space first, then hub space as fallback.
+
+    Args:
+        mcp: MCP client manager
+        space_keys: List of space keys to search (in priority order)
+
+    Returns:
+        Folder page ID or None if not found
+    """
+    for space_key in space_keys:
+        for keyword in _TEMPLATES_FOLDER_KEYWORDS:
+            try:
+                cql = f'space = "{space_key}" AND title = "{keyword}"'
+                results = mcp.confluence_search_pages(cql, limit=3)
+
+                if "Found 0 pages" not in results:
+                    pages = _parse_search_results(results)
+                    if pages:
+                        logger.info(
+                            f"Template Compliance: Found '{keyword}' folder in space '{space_key}'"
+                        )
+                        return pages[0]["id"]
+            except Exception as e:
+                logger.warning(f"Template Compliance: Error searching for '{keyword}' in '{space_key}': {e}")
+
+    return None
+
+
+def _find_template_page(
+    mcp: MCPClientManager,
+    templates_folder_id: str,
+    doc_type: str,
+    keywords: list[str],
+) -> ConfluenceTemplate | None:
+    """
+    Find and read a specific template page within the Templates folder.
+
+    Args:
+        mcp: MCP client manager
+        templates_folder_id: ID of the Templates folder
+        doc_type: Document type name (e.g., "Project Passport")
+        keywords: Search keywords for the template
+
+    Returns:
+        ConfluenceTemplate or None if not found
+    """
+    for keyword in keywords:
+        try:
+            cql = f'ancestor = {templates_folder_id} AND title ~ "{keyword}"'
+            results = mcp.confluence_search_pages(cql, limit=3)
+
+            if "Found 0 pages" not in results:
+                pages = _parse_search_results(results)
+                if pages:
+                    page = pages[0]
+                    # Fetch full page content
+                    full_page = mcp.confluence_get_page(page_id=page["id"])
+                    content = _extract_text_content(full_page)
+
+                    if content and len(content.strip()) > MIN_PAGE_CONTENT_LENGTH:
+                        return ConfluenceTemplate(
+                            doc_type=doc_type,
+                            title=page["title"],
+                            content=content,
+                            page_id=page["id"],
+                            url=page.get("url", ""),
+                        )
+        except Exception as e:
+            logger.warning(f"Template Compliance: Error fetching template '{keyword}': {e}")
+
+    return None
+
+
+# =============================================================================
 # Stage 4: Data Aggregation
 # =============================================================================
 
@@ -1637,6 +1939,14 @@ def build_refined_context_pipeline(
     else:
         logger.info("Stage 3b: GitHub MCP not available - skipping")
 
+    # Stage 3c: Template Compliance (retrieve Confluence templates)
+    hub_space = (config or {}).get("confluence", {}).get("templates_space")
+    templates = retrieve_confluence_templates(mcp, jira_context.project_key, hub_space=hub_space)
+    if templates:
+        logger.info(f"Stage 3c: Retrieved {len(templates)} templates for compliance")
+    else:
+        logger.info("Stage 3c: No templates found — using default layout")
+
     # Stage 4: Aggregation
     execution_context = build_execution_context(
         issue_key=issue_key,
@@ -1644,5 +1954,6 @@ def build_refined_context_pipeline(
         refined_confluence=refined_confluence,
         github_context=github_context,
     )
+    execution_context.confluence_templates = templates
 
     return execution_context

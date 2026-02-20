@@ -16,8 +16,10 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import sys
+import time
 import logging
 from pathlib import Path
 from dotenv import load_dotenv
@@ -31,14 +33,19 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from executor.mcp.client import MCPClientManager
 from executor.utils.config_loader import load_config
+from executor.utils.structured_logging import setup_structured_logging
+from executor.models.llm_metrics import PipelineMetrics, StageMetrics
 from executor.phases import (
     parse_issue_key,
+    get_issue_status,
     build_context_pipeline,
     build_refined_context_pipeline,
     LLMExecutor,
     handle_post_execution,
     ExecutionOutcome,
+    execute_phase_zero,
 )
+from executor.phases.context_store import save_context, load_context
 from openai import OpenAI
 
 console = Console()
@@ -105,6 +112,7 @@ def execute_pipeline(
     task_input: str,
     dry_run: bool = False,
     output_dir: str = "outputs",
+    json_logs: bool = False,
 ) -> int:
     """
     Execute the full 5-stage pipeline.
@@ -113,12 +121,16 @@ def execute_pipeline(
         task_input: Jira issue key or URL
         dry_run: If True, skip LLM execution (Stages 1-4 only)
         output_dir: Directory for output files
+        json_logs: If True, use JSON structured logging
 
     Returns:
         Exit code (0 = success, 1 = error)
     """
     # Stage 1: Parse issue key
     issue_key = parse_issue_key(task_input)
+
+    # Initialize pipeline metrics
+    pipeline_metrics = PipelineMetrics(issue_key=issue_key)
 
     console.print(Panel.fit(
         f"[bold cyan]AI-SWARM Executor[/bold cyan]\n"
@@ -161,6 +173,94 @@ def execute_pipeline(
         console.print("  [green]✓[/green] MCP servers started")
 
         # =================================================================
+        # Stage 1.5: Auto-detect issue status and route to correct phase
+        # =================================================================
+        console.print("\n[bold]Stage 1: Status Detection[/bold]")
+        try:
+            issue_status = get_issue_status(mcp, issue_key)
+            console.print(f"  [green]✓[/green] Issue status: {issue_status}")
+        except Exception as e:
+            console.print(f"  [red]✗ Failed to get issue status: {e}[/red]")
+            return 1
+
+        # Route based on status
+        status_lower = issue_status.lower().strip()
+
+        if status_lower == "backlog":
+            console.print(f"  [cyan]→[/cyan] Routing to Phase 0: Backlog Analysis")
+            console.print("")
+
+            if not deepseek_client:
+                console.print("  [red]✗ Phase 0 requires DeepSeek API key[/red]")
+                return 1
+
+            agent_config = config.model_dump().get("agent", {})
+            model = agent_config.get("model", "deepseek-chat")
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                console=console,
+                transient=True,
+            ) as progress:
+                task = progress.add_task("Phase 0: Building context & analyzing requirements...", total=None)
+
+                result = execute_phase_zero(
+                    mcp=mcp,
+                    llm_client=deepseek_client,
+                    issue_key=issue_key,
+                    config=config.model_dump(),
+                    output_dir=output_dir,
+                    model=model,
+                    dry_run=dry_run,
+                )
+
+            if result.error:
+                console.print(f"\n[red]✗ Phase 0 failed: {result.error}[/red]")
+                return 1
+
+            resp = result.response
+            console.print(f"  [green]✓[/green] LLM response ({resp.tokens_used} tokens)")
+            console.print(f"  [green]✓[/green] Feature Type: {resp.feature_type}")
+            console.print(f"  [green]✓[/green] Complexity: {resp.complexity_estimate}")
+
+            if result.validation_errors:
+                console.print(f"\n  [yellow]⚠ Validation warnings:[/yellow]")
+                for err in result.validation_errors:
+                    console.print(f"    - {err}")
+            else:
+                console.print(f"  [green]✓[/green] Validation passed")
+
+            if result.output_file:
+                console.print(f"  [green]✓[/green] Output: {result.output_file}")
+
+            if result.jira_updated:
+                console.print(f"  [green]✓[/green] Jira description updated for {issue_key}")
+            elif dry_run:
+                console.print(f"  [dim]  Jira update skipped (dry-run)[/dim]")
+
+            if result.dor_met:
+                console.print(f"\n  [bold green]✓ Definition of Ready: MET[/bold green]")
+            else:
+                console.print(f"\n  [bold yellow]⚠ Definition of Ready: NOT MET[/bold yellow]")
+
+            if resp.chain_of_thought:
+                console.print("\n[bold]Analysis Summary:[/bold]")
+                console.print("=" * 70)
+                console.print(Markdown(resp.chain_of_thought[:1500]))
+                console.print("=" * 70)
+
+            console.print("\n[bold green]✓ Phase 0 completed successfully[/bold green]")
+            return 0
+
+        # For non-Backlog statuses, continue with the existing pipeline
+        if status_lower not in ("ai to do", "ai-to-do", "ai todo"):
+            console.print(
+                f"  [yellow]⚠[/yellow] Issue is in '{issue_status}' — "
+                f"expected 'Backlog' or 'AI To Do'. Proceeding with full pipeline."
+            )
+
+        # =================================================================
         # Stages 2-4: Context Building
         # =================================================================
         console.print("\n[bold]Stages 2-4: Building Context[/bold]")
@@ -182,6 +282,7 @@ def execute_pipeline(
             )
 
             try:
+                context_start = time.time()
                 # Use Two-Stage Retrieval if DeepSeek is available
                 if deepseek_client:
                     progress.update(task, description="Stage 2: Jira Enrichment...")
@@ -202,8 +303,21 @@ def execute_pipeline(
                     )
                     progress.update(task, description="Stage 3: Confluence Knowledge...")
                     progress.update(task, description="Stage 4: Data Aggregation...")
+
+                context_duration = int((time.time() - context_start) * 1000)
+                pipeline_metrics.add_stage(StageMetrics(
+                    stage_name="context_building",
+                    duration_ms=context_duration,
+                ))
             except Exception as e:
                 context_error = e
+                context_duration = int((time.time() - context_start) * 1000)
+                pipeline_metrics.add_stage(StageMetrics(
+                    stage_name="context_building",
+                    duration_ms=context_duration,
+                    success=False,
+                    error=str(e),
+                ))
                 logger.error(f"Context building failed: {e}")
 
         # Handle context building failure
@@ -292,6 +406,10 @@ def execute_pipeline(
                     console.print(f"  [green]✓[/green] Added explanation comment")
             return 1
 
+        # Save context for future refinement (before Stage 5)
+        save_context(execution_context, output_dir)
+        console.print(f"  [green]✓[/green] Context saved for refinement")
+
         # =================================================================
         # Stage 5: LLM Execution (or dry-run)
         # =================================================================
@@ -323,6 +441,7 @@ def execute_pipeline(
         else:
             console.print("\n[bold]Stage 5: LLM Execution[/bold]")
 
+            llm_start = time.time()
             with Progress(
                 SpinnerColumn(),
                 TextColumn("[progress.description]{task.description}"),
@@ -342,6 +461,14 @@ def execute_pipeline(
                 )
 
                 response, output = executor.execute(execution_context)
+
+            llm_duration = int((time.time() - llm_start) * 1000)
+            pipeline_metrics.add_stage(StageMetrics(
+                stage_name="llm_execution",
+                duration_ms=llm_duration,
+                metadata={"tokens": response.tokens_used, "model": model},
+            ))
+            pipeline_metrics.llm_metrics = executor.metrics
 
             console.print(f"  [green]✓[/green] LLM response received ({response.tokens_used} tokens)")
             console.print(f"  [green]✓[/green] Context: {output.context_file}")
@@ -371,6 +498,7 @@ def execute_pipeline(
             # Post-Execution: Analysis & Decomposition + Transition
             # =================================================================
             console.print("\n[bold]Post-Execution: Analysis & Decomposition[/bold]")
+            post_start = time.time()
             result = handle_post_execution(
                 mcp=mcp,
                 issue_key=issue_key,
@@ -380,11 +508,21 @@ def execute_pipeline(
                 config=config.model_dump(),
                 dry_run=False,
             )
+            post_duration = int((time.time() - post_start) * 1000)
 
+            post_meta = {}
             # Show decomposition results
             if result.decomposition_result:
                 dr = result.decomposition_result
                 console.print(f"  [green]✓[/green] Parsed {len(dr.stories)} stories")
+                # Show confidence
+                conf_pct = f"{dr.overall_confidence:.0%}"
+                if dr.overall_confidence >= 0.7:
+                    console.print(f"  [green]✓[/green] Overall confidence: {conf_pct}")
+                else:
+                    console.print(f"  [yellow]⚠[/yellow] Overall confidence: {conf_pct} (below threshold)")
+                if dr.low_confidence_stories:
+                    console.print(f"  [yellow]⚠[/yellow] {len(dr.low_confidence_stories)} stories below confidence threshold")
                 if dr.review_task_key:
                     console.print(f"  [green]✓[/green] Created review task: {dr.review_task_key}")
                 else:
@@ -393,16 +531,465 @@ def execute_pipeline(
                     console.print(f"  [yellow]![/yellow] {len(dr.questions)} clarifications needed")
                 console.print(f"  [green]✓[/green] Added decomposition comments")
 
+                # Populate pipeline metrics from decomposition
+                pipeline_metrics.stories_extracted = len(dr.stories)
+                pipeline_metrics.stories_created = 1 if dr.review_task_key else 0
+                pipeline_metrics.overall_confidence = dr.overall_confidence
+                pipeline_metrics.validation_pass = result.outcome != ExecutionOutcome.EXECUTION_ERROR
+                post_meta["stories"] = len(dr.stories)
+                post_meta["confidence"] = f"{dr.overall_confidence:.0%}"
+
             if result.error:
                 console.print(f"  [yellow]⚠[/yellow] Transition failed: {result.error}")
+                pipeline_metrics.add_stage(StageMetrics(
+                    stage_name="post_execution",
+                    duration_ms=post_duration,
+                    success=False,
+                    error=result.error,
+                    metadata=post_meta,
+                ))
             else:
                 console.print(f"  [green]✓[/green] Transitioned to {result.target_status}")
+                pipeline_metrics.add_stage(StageMetrics(
+                    stage_name="post_execution",
+                    duration_ms=post_duration,
+                    metadata=post_meta,
+                ))
+
+            # Finalize and save pipeline metrics
+            pipeline_metrics.finalize()
+
+            issue_dir = Path(output_dir) / issue_key
+            issue_dir.mkdir(parents=True, exist_ok=True)
+
+            metrics_md_path = issue_dir / f"{issue_key}_pipeline_metrics.md"
+            metrics_md_path.write_text(pipeline_metrics.to_markdown(), encoding="utf-8")
+            console.print(f"  [green]✓[/green] Metrics: {metrics_md_path}")
+
+            if json_logs:
+                metrics_json_path = issue_dir / f"{issue_key}_pipeline_metrics.json"
+                metrics_json_path.write_text(
+                    json.dumps(pipeline_metrics.to_json(), indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                console.print(f"  [green]✓[/green] Metrics JSON: {metrics_json_path}")
 
         console.print("\n[bold green]✓ Pipeline completed successfully[/bold green]")
         return 0
 
     except Exception as e:
         console.print(f"\n[bold red]✗ Error during execution: {e}[/bold red]")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+    finally:
+        console.print("\n[dim]Stopping MCP servers...[/dim]")
+        mcp.stop_all()
+
+
+def create_stories_pipeline(task_input: str, output_dir: str = "outputs") -> int:
+    """
+    Create Jira Stories from approved decomposition.
+
+    Args:
+        task_input: Jira issue key or URL
+        output_dir: Output directory (unused, for consistency)
+
+    Returns:
+        Exit code (0 = success, 1 = error)
+    """
+    from executor.phases.story_creator import (
+        check_review_approved,
+        extract_stories_from_comment,
+        create_jira_stories,
+        create_dependency_links,
+    )
+
+    issue_key = parse_issue_key(task_input)
+    project_key = issue_key.split("-")[0]
+
+    console.print(Panel.fit(
+        f"[bold cyan]AI-SWARM Story Creator[/bold cyan]\n"
+        f"Feature: {issue_key}",
+        border_style="cyan",
+    ))
+
+    # Load environment and config
+    env_vars = load_environment()
+    config_path = Path(__file__).parent / "config" / "sdlc_config.yaml"
+    config = load_config(config_path)
+
+    mcp = MCPClientManager()
+
+    try:
+        console.print("\n  Starting MCP servers...")
+        mcp.start_all(env_vars)
+        console.print("  [green]✓[/green] MCP servers started")
+
+        # Step 1: Check review approval
+        console.print("\n[bold]Step 1: Checking review approval[/bold]")
+        approved, review_key = check_review_approved(mcp, issue_key)
+
+        if review_key:
+            console.print(f"  Found review task: {review_key}")
+        else:
+            console.print("  [red]✗ No review task found[/red]")
+            console.print("  Run the full pipeline first: python3 execute.py --task " + issue_key)
+            return 1
+
+        if not approved:
+            console.print(f"  [red]✗ Review task {review_key} is not Done[/red]")
+            console.print("  Approve the review task before creating stories.")
+            return 1
+
+        console.print(f"  [green]✓[/green] Review task {review_key} is approved")
+
+        # Step 2: Extract stories from comment
+        console.print("\n[bold]Step 2: Extracting stories from decomposition[/bold]")
+        stories = extract_stories_from_comment(mcp, issue_key)
+
+        if not stories:
+            console.print("  [red]✗ No stories found in decomposition comment[/red]")
+            return 1
+
+        console.print(f"  [green]✓[/green] Found {len(stories)} stories")
+        for story in stories:
+            console.print(f"    {story.order}. [{story.layer}] {story.title}")
+
+        # Step 3: Create Jira stories
+        console.print(f"\n[bold]Step 3: Creating Jira Stories in {project_key}[/bold]")
+        created = create_jira_stories(
+            mcp=mcp,
+            parent_key=issue_key,
+            project_key=project_key,
+            stories=stories,
+            config=config.model_dump(),
+        )
+
+        # Step 4: Create dependency links
+        has_deps = any(story.depends_on for story, _ in created)
+        if has_deps:
+            console.print(f"\n[bold]Step 4: Creating dependency links[/bold]")
+            dep_count = create_dependency_links(mcp, created)
+            console.print(f"  [green]✓[/green] Created {dep_count} dependency links")
+
+        # Report results
+        console.print(f"\n[bold]Results:[/bold]")
+        for story, key in created:
+            deps_str = ""
+            if story.depends_on:
+                dep_keys = []
+                order_to_key = {s.order: k for s, k in created}
+                for d in story.depends_on:
+                    dk = order_to_key.get(d, f"Step {d}")
+                    dep_keys.append(dk)
+                deps_str = f" (blocked by: {', '.join(dep_keys)})"
+            console.print(f"  [green]✓[/green] {key}: [{story.layer}] {story.title}{deps_str}")
+
+        failed = len(stories) - len(created)
+        if failed > 0:
+            console.print(f"  [yellow]⚠[/yellow] {failed} stories failed to create")
+
+        console.print(f"\n[bold green]✓ Created {len(created)}/{len(stories)} stories[/bold green]")
+        return 0
+
+    except Exception as e:
+        console.print(f"\n[bold red]✗ Error: {e}[/bold red]")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+    finally:
+        console.print("\n[dim]Stopping MCP servers...[/dim]")
+        mcp.stop_all()
+
+
+def refinement_pipeline(
+    task_input: str,
+    feedback: str,
+    output_dir: str = "outputs",
+    json_logs: bool = False,
+) -> int:
+    """
+    Refine a previous plan using human feedback.
+
+    Loads saved context from a previous execution and re-runs Stage 5
+    with a refinement prompt that incorporates the feedback.
+
+    Args:
+        task_input: Jira issue key or URL
+        feedback: Human feedback text
+        output_dir: Output directory
+        json_logs: If True, use JSON structured logging
+
+    Returns:
+        Exit code (0 = success, 1 = error)
+    """
+    issue_key = parse_issue_key(task_input)
+
+    console.print(Panel.fit(
+        f"[bold cyan]AI-SWARM Refinement[/bold cyan]\n"
+        f"Refining: {issue_key}",
+        border_style="cyan",
+    ))
+
+    # Load saved context
+    console.print("\n[bold]Step 1: Loading saved context[/bold]")
+    execution_context = load_context(issue_key, output_dir)
+
+    if not execution_context:
+        console.print("  [red]✗ No saved context found[/red]")
+        console.print(f"  Run the full pipeline first: python3 execute.py --task {issue_key}")
+        return 1
+
+    console.print(f"  [green]✓[/green] Loaded context from {execution_context.timestamp.isoformat()}")
+
+    # Find the latest plan version
+    console.print("\n[bold]Step 2: Loading previous plan[/bold]")
+    issue_dir = Path(output_dir) / issue_key
+
+    # Find the latest plan file (plan.md, plan_v2.md, plan_v3.md, ...)
+    plan_files = sorted(issue_dir.glob(f"{issue_key}_plan*.md"))
+    if not plan_files:
+        console.print("  [red]✗ No previous plan found[/red]")
+        return 1
+
+    latest_plan_file = plan_files[-1]
+    previous_plan = latest_plan_file.read_text(encoding="utf-8")
+
+    # Determine version number
+    version = 2
+    if "_v" in latest_plan_file.stem:
+        try:
+            version = int(latest_plan_file.stem.split("_v")[-1]) + 1
+        except ValueError:
+            version = 2
+
+    console.print(f"  [green]✓[/green] Loaded: {latest_plan_file.name}")
+    console.print(f"  Generating refined plan v{version}")
+
+    # Check DeepSeek API key
+    deepseek_key = os.getenv("DEEPSEEK_API_KEY")
+    if not deepseek_key:
+        # Need to load env
+        load_environment()
+        deepseek_key = os.getenv("DEEPSEEK_API_KEY")
+
+    if not deepseek_key:
+        console.print("  [red]✗ DEEPSEEK_API_KEY not found[/red]")
+        return 1
+
+    # Load config for model selection
+    config_path = Path(__file__).parent / "config" / "sdlc_config.yaml"
+    config = load_config(config_path)
+    agent_config = config.model_dump().get("agent", {})
+    model = agent_config.get("model", "deepseek-chat")
+
+    # Execute refinement (no MCP needed — just LLM call)
+    console.print(f"\n[bold]Step 3: Calling LLM for refinement[/bold]")
+    console.print(f"  Feedback: {feedback[:100]}{'...' if len(feedback) > 100 else ''}")
+
+    executor = LLMExecutor(
+        api_key=deepseek_key,
+        model=model,
+        output_dir=output_dir,
+    )
+
+    try:
+        response, output = executor.execute_refinement(
+            context=execution_context,
+            feedback=feedback,
+            previous_plan=previous_plan,
+            version=version,
+        )
+    except Exception as e:
+        console.print(f"  [red]✗ LLM call failed: {e}[/red]")
+        return 1
+
+    console.print(f"  [green]✓[/green] Refined plan generated ({response.tokens_used} tokens)")
+    console.print(f"  [green]✓[/green] Plan: {output.plan_file}")
+    console.print(f"  [green]✓[/green] Reasoning: {output.reasoning_file}")
+
+    # Show refined work plan summary
+    console.print("\n[bold]Refined Work Plan v{version}:[/bold]")
+    console.print("=" * 70)
+    if response.work_plan:
+        console.print(Markdown(response.work_plan[:1500]))
+    else:
+        console.print("[yellow]Work plan section not found[/yellow]")
+    console.print("=" * 70)
+
+    # Optionally post to Jira (requires MCP)
+    console.print(f"\n[bold]Step 4: Post to Jira[/bold]")
+
+    env_vars = load_environment()
+    mcp = MCPClientManager()
+
+    try:
+        mcp.start_all(env_vars)
+        console.print("  [green]✓[/green] MCP servers started")
+
+        result = handle_post_execution(
+            mcp=mcp,
+            issue_key=issue_key,
+            execution_context=execution_context,
+            plan_summary=response.work_plan[:1000] if response.work_plan else None,
+            llm_response=response,
+            config=config.model_dump(),
+            dry_run=False,
+        )
+
+        if result.decomposition_result:
+            dr = result.decomposition_result
+            console.print(f"  [green]✓[/green] Parsed {len(dr.stories)} stories (Refined Plan v{version})")
+            if dr.review_task_key:
+                console.print(f"  [green]✓[/green] Updated review task: {dr.review_task_key}")
+
+        if result.error:
+            console.print(f"  [yellow]⚠[/yellow] Transition: {result.error}")
+        else:
+            console.print(f"  [green]✓[/green] Transitioned to {result.target_status}")
+
+    except Exception as e:
+        console.print(f"  [yellow]⚠[/yellow] Jira update failed: {e}")
+        console.print("  Refined plan is saved locally but not posted to Jira.")
+
+    finally:
+        mcp.stop_all()
+
+    console.print(f"\n[bold green]✓ Refinement v{version} completed[/bold green]")
+    return 0
+
+
+def phase_zero_pipeline(
+    task_input: str,
+    dry_run: bool = False,
+    output_dir: str = "outputs",
+) -> int:
+    """
+    Execute Phase 0: Backlog Analysis pipeline.
+
+    Transforms raw Jira backlog descriptions into structured Use Cases
+    and Definition of Ready. Output goes to Jira only (Confluence read-only).
+
+    Args:
+        task_input: Jira issue key or URL
+        dry_run: If True, skip Jira comment posting
+        output_dir: Directory for output files
+
+    Returns:
+        Exit code (0 = success, 1 = error)
+    """
+    issue_key = parse_issue_key(task_input)
+
+    console.print(Panel.fit(
+        f"[bold cyan]AI-SWARM Phase 0: Backlog Analysis[/bold cyan]\n"
+        f"Processing: {issue_key}" + (" [dry-run]" if dry_run else ""),
+        border_style="cyan",
+    ))
+
+    # Load environment
+    console.print("\n[bold]Initialization[/bold]")
+    env_vars = load_environment()
+    console.print("  [green]✓[/green] Environment loaded")
+
+    # Load config
+    config_path = Path(__file__).parent / "config" / "sdlc_config.yaml"
+    config = load_config(config_path)
+    console.print("  [green]✓[/green] Configuration loaded")
+
+    # Check DeepSeek API key
+    deepseek_key = os.getenv("DEEPSEEK_API_KEY")
+    if not deepseek_key:
+        console.print("  [red]✗ DEEPSEEK_API_KEY not found[/red]")
+        return 1
+
+    deepseek_client = OpenAI(
+        api_key=deepseek_key,
+        base_url="https://api.deepseek.com"
+    )
+
+    agent_config = config.model_dump().get("agent", {})
+    model = agent_config.get("model", "deepseek-chat")
+    console.print(f"  [green]✓[/green] DeepSeek client initialized (model: {model})")
+
+    # Initialize MCP manager
+    mcp = MCPClientManager()
+
+    try:
+        console.print("  Starting MCP servers...")
+        mcp.start_all(env_vars)
+        console.print("  [green]✓[/green] MCP servers started")
+
+        # Execute Phase 0
+        console.print("\n[bold]Phase 0: Backlog Analysis[/bold]")
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+            transient=True,
+        ) as progress:
+            task = progress.add_task("Building context & analyzing requirements...", total=None)
+
+            result = execute_phase_zero(
+                mcp=mcp,
+                llm_client=deepseek_client,
+                issue_key=issue_key,
+                config=config.model_dump(),
+                output_dir=output_dir,
+                model=model,
+                dry_run=dry_run,
+            )
+
+        # Handle errors
+        if result.error:
+            console.print(f"\n[red]✗ Phase 0 failed: {result.error}[/red]")
+            return 1
+
+        # Display results
+        resp = result.response
+        console.print(f"  [green]✓[/green] LLM response received ({resp.tokens_used} tokens)")
+        console.print(f"  [green]✓[/green] Feature Type: {resp.feature_type}")
+        console.print(f"  [green]✓[/green] Complexity: {resp.complexity_estimate}")
+
+        if result.validation_errors:
+            console.print(f"\n  [yellow]⚠ Validation warnings:[/yellow]")
+            for err in result.validation_errors:
+                console.print(f"    - {err}")
+        else:
+            console.print(f"  [green]✓[/green] Validation passed")
+
+        if result.output_file:
+            console.print(f"  [green]✓[/green] Output: {result.output_file}")
+
+        if result.jira_updated:
+            console.print(f"  [green]✓[/green] Jira description updated for {issue_key}")
+        elif dry_run:
+            console.print(f"  [dim]  Jira update skipped (dry-run)[/dim]")
+
+        # DoR status
+        if result.dor_met:
+            console.print(f"\n  [bold green]✓ Definition of Ready: MET[/bold green]")
+            console.print(f"  Issue {issue_key} is ready for AI-TO-DO transition.")
+        else:
+            console.print(f"\n  [bold yellow]⚠ Definition of Ready: NOT MET[/bold yellow]")
+            if result.validation_errors:
+                console.print(f"  Analysis has validation issues.")
+
+        # Show summary
+        console.print("\n[bold]Analysis Summary:[/bold]")
+        console.print("=" * 70)
+        if resp.chain_of_thought:
+            console.print(Markdown(resp.chain_of_thought[:1500]))
+        console.print("=" * 70)
+
+        console.print("\n[bold green]✓ Phase 0 completed successfully[/bold green]")
+        return 0
+
+    except Exception as e:
+        console.print(f"\n[bold red]✗ Error during Phase 0: {e}[/bold red]")
         import traceback
         traceback.print_exc()
         return 1
@@ -419,9 +1006,17 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python3 execute.py --task PROJ-123
+  python3 execute.py --phase0 PROJ-123             # Phase 0: Backlog Analysis
+  python3 execute.py --phase0 PROJ-123 --dry-run   # Phase 0: skip Jira comment
+  python3 execute.py --task PROJ-123               # Full pipeline (Stages 1-5)
   python3 execute.py --task PROJ-123 --dry-run
+  python3 execute.py --task PROJ-123 --json-logs
+  python3 execute.py --create-stories PROJ-123
+  python3 execute.py --refine PROJ-123 --feedback "Split step 3 into BE and FE"
   python3 execute.py -t PROJ-123 -o ./my_outputs
+
+Phases:
+  0. Phase 0       - Backlog Analysis (Use Case + DoR)
 
 Stages:
   1. Trigger       - Parse Jira issue key
@@ -434,8 +1029,30 @@ Stages:
 
     parser.add_argument(
         "--task", "-t",
-        required=True,
-        help="Jira issue key or URL"
+        help="Jira issue key or URL (for full pipeline)"
+    )
+
+    parser.add_argument(
+        "--create-stories",
+        metavar="ISSUE_KEY",
+        help="Create Jira Stories from approved decomposition"
+    )
+
+    parser.add_argument(
+        "--phase0",
+        metavar="ISSUE_KEY",
+        help="Run Phase 0: Backlog Analysis (Use Case + DoR generation)"
+    )
+
+    parser.add_argument(
+        "--refine",
+        metavar="ISSUE_KEY",
+        help="Refine a previous plan with human feedback"
+    )
+
+    parser.add_argument(
+        "--feedback",
+        help="Feedback text for --refine mode (required with --refine)"
     )
 
     parser.add_argument(
@@ -450,13 +1067,72 @@ Stages:
         help="Output directory for generated files (default: outputs)"
     )
 
+    parser.add_argument(
+        "--json-logs",
+        action="store_true",
+        help="Use JSON structured logging (for CI/automation)"
+    )
+
     args = parser.parse_args()
+
+    # Configure structured logging if requested
+    if args.json_logs:
+        setup_structured_logging(level="INFO", json_output=True)
+
+    # Dispatch to appropriate pipeline
+    if args.phase0:
+        try:
+            return phase_zero_pipeline(
+                task_input=args.phase0,
+                dry_run=args.dry_run,
+                output_dir=args.output_dir,
+            )
+        except ValueError as e:
+            console.print(f"[red]Error: {e}[/red]")
+            return 1
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Cancelled by user[/yellow]")
+            return 130
+
+    if args.create_stories:
+        try:
+            return create_stories_pipeline(
+                task_input=args.create_stories,
+                output_dir=args.output_dir,
+            )
+        except ValueError as e:
+            console.print(f"[red]Error: {e}[/red]")
+            return 1
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Cancelled by user[/yellow]")
+            return 130
+
+    if args.refine:
+        if not args.feedback:
+            parser.error("--feedback is required with --refine")
+        try:
+            return refinement_pipeline(
+                task_input=args.refine,
+                feedback=args.feedback,
+                output_dir=args.output_dir,
+                json_logs=args.json_logs,
+            )
+        except ValueError as e:
+            console.print(f"[red]Error: {e}[/red]")
+            return 1
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Cancelled by user[/yellow]")
+            return 130
+
+    if not args.task:
+        parser.error("--task is required (or use --phase0 / --create-stories / --refine)")
 
     try:
         return execute_pipeline(
             task_input=args.task,
             dry_run=args.dry_run,
             output_dir=args.output_dir,
+            json_logs=args.json_logs,
         )
 
     except ValueError as e:

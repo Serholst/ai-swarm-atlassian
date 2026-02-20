@@ -49,6 +49,7 @@ Create a step-by-step plan. For each step:
   - **Layer:** [BE/FE/INFRA/DB/QA/DOCS/GEN]
   - **Files:** [Expected files to create/modify]
   - **Acceptance:** [How to verify this step is complete]
+  - **Depends on:** [Step M, Step K] or [None]
 ```
 
 Layer codes:
@@ -78,4 +79,5 @@ Evaluate readiness:
 4. **Be Specific:** Provide concrete file paths, API endpoints, component names
 5. **Prioritize Clarity:** If task is unclear, emphasize this in Concerns section
 6. **Follow SDLC:** Adhere to workflow rules from the knowledge base
+7. **Template Compliance:** When Confluence templates are provided in the context, your DOCS layer steps MUST follow the exact structure, headings, and sections from those templates. Do NOT invent arbitrary page layouts.
 """

@@ -26,6 +26,9 @@ class DecomposedStory:
     acceptance: str     # Acceptance criteria
     files: list[str] = field(default_factory=list)  # Expected files to modify/create
     order: int = 0      # Sequence in work plan
+    depends_on: list[int] = field(default_factory=list)  # Step numbers this depends on
+    confidence: float = 0.0  # Heuristic confidence score (0.0–1.0)
+    confidence_flags: list[str] = field(default_factory=list)  # Reasons for low confidence
 
 
 @dataclass
@@ -65,6 +68,10 @@ class DecompositionResult:
     # Metadata
     complexity: str = "M"       # S, M, L, XL
     feature_title: str = ""     # Feature summary for context
+
+    # Confidence scoring
+    overall_confidence: float = 0.0  # Average story confidence (0.0–1.0)
+    low_confidence_stories: list[int] = field(default_factory=list)  # Story orders below threshold
 
     # Created Jira artifact keys
     review_task_key: Optional[str] = None  # Key of created review Story

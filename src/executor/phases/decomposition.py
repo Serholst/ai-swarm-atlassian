@@ -21,11 +21,7 @@ from ..models.decomposition import (
     ClarificationQuestion,
     DecompositionResult,
 )
-from ..utils.markdown_formatter import (
-    format_cot_panel,
-    format_draft_comment_header,
-    format_story_list,
-)
+from ..mcp.servers.jira_server import MarkdownToADF
 from .llm_executor import LLMResponse
 
 logger = logging.getLogger(__name__)
@@ -68,9 +64,14 @@ def extract_stories(work_plan: str) -> list[DecomposedStory]:
 
         # Extract layer
         layer_match = re.search(r"\*\*Layer:\*\*\s*\[?(\w+)\]?", step_content, re.IGNORECASE)
-        layer = layer_match.group(1).upper() if layer_match else "GEN"
-        if layer not in VALID_LAYERS:
+        if not layer_match:
+            logger.warning(f"Step {step_num}: No Layer tag found, defaulting to GEN")
             layer = "GEN"
+        else:
+            layer = layer_match.group(1).upper()
+            if layer not in VALID_LAYERS:
+                logger.warning(f"Step {step_num}: Invalid layer '{layer}', defaulting to GEN")
+                layer = "GEN"
 
         # Extract files - handle both inline and bullet formats
         files_match = re.search(r"\*\*Files:\*\*\s*(.+?)(?=-\s*\*\*|\n\n|\Z)", step_content, re.DOTALL | re.IGNORECASE)
@@ -83,6 +84,17 @@ def extract_stories(work_plan: str) -> list[DecomposedStory]:
         acceptance_match = re.search(r"\*\*Acceptance:\*\*\s*(.+?)(?=\*\*|$)", step_content, re.DOTALL | re.IGNORECASE)
         acceptance = acceptance_match.group(1).strip() if acceptance_match else ""
 
+        # Extract dependencies
+        depends_match = re.search(
+            r"\*\*Depends on:\*\*\s*(.+?)(?=-\s*\*\*|\n\n|\Z)", step_content, re.DOTALL | re.IGNORECASE
+        )
+        depends_on: list[int] = []
+        if depends_match:
+            deps_text = depends_match.group(1).strip()
+            if deps_text.lower() not in ("none", "n/a", "-", ""):
+                dep_nums = re.findall(r"Step\s+(\d+)", deps_text, re.IGNORECASE)
+                depends_on = [int(n) for n in dep_nums]
+
         # Extract title (first line after Step N:)
         title_match = re.match(r"([^\n]+)", step_content)
         title = title_match.group(1).strip() if title_match else f"Step {step_num}"
@@ -90,7 +102,7 @@ def extract_stories(work_plan: str) -> list[DecomposedStory]:
         title = re.sub(r"\s*-\s*\*\*Layer.*$", "", title, flags=re.IGNORECASE).strip()
 
         # Description is the cleaned content
-        description = re.sub(r"-\s*\*\*(?:Layer|Files|Acceptance):\*\*.*?(?=(?:-\s*\*\*|\Z))", "", step_content, flags=re.DOTALL | re.IGNORECASE).strip()
+        description = re.sub(r"-\s*\*\*(?:Layer|Files|Acceptance|Depends on):\*\*.*?(?=(?:-\s*\*\*|\Z))", "", step_content, flags=re.DOTALL | re.IGNORECASE).strip()
 
         story = DecomposedStory(
             layer=layer,
@@ -99,6 +111,7 @@ def extract_stories(work_plan: str) -> list[DecomposedStory]:
             acceptance=acceptance,
             files=files,
             order=step_num,
+            depends_on=depends_on,
         )
         stories.append(story)
 
@@ -211,7 +224,12 @@ def extract_alternatives(analysis: str) -> str:
     return ""
 
 
-def parse_llm_response(response: LLMResponse, issue_key: str, feature_title: str) -> DecompositionResult:
+def parse_llm_response(
+    response: LLMResponse,
+    issue_key: str,
+    feature_title: str,
+    execution_context: Optional[ExecutionContext] = None,
+) -> DecompositionResult:
     """
     Parse LLM response into DecompositionResult.
 
@@ -219,12 +237,24 @@ def parse_llm_response(response: LLMResponse, issue_key: str, feature_title: str
         response: LLMResponse from Stage 5
         issue_key: Jira issue key
         feature_title: Feature summary
+        execution_context: Optional context for confidence scoring
 
     Returns:
-        DecompositionResult with parsed data
+        DecompositionResult with parsed data and confidence scores
     """
     # Extract stories from work plan
     stories = extract_stories(response.work_plan)
+
+    # Score confidence for each story
+    from .confidence import score_story_confidence, score_overall_confidence, flag_low_confidence
+
+    for story in stories:
+        score, flags = score_story_confidence(story, execution_context)
+        story.confidence = score
+        story.confidence_flags = flags
+
+    overall_confidence = score_overall_confidence(stories)
+    low_confidence = flag_low_confidence(stories)
 
     # Extract questions from concerns (optional)
     questions = extract_questions(response.concerns)
@@ -243,6 +273,8 @@ def parse_llm_response(response: LLMResponse, issue_key: str, feature_title: str
         cot_alternatives=alternatives,
         complexity=complexity,
         feature_title=feature_title,
+        overall_confidence=overall_confidence,
+        low_confidence_stories=low_confidence,
         review_task_key=None,
     )
 
@@ -250,40 +282,28 @@ def parse_llm_response(response: LLMResponse, issue_key: str, feature_title: str
 def create_blocking_review_task(
     mcp: MCPClientManager,
     project_key: str,
-    parent_key: str,
     issue_key: str,
-    config: dict,
 ) -> Optional[str]:
     """
     Create blocking review Story.
 
     Creates: [REVIEW] {Issue_Key} Approve Architecture (HUMAN)
-    Links:
-    - "is child of" link to parent Feature (Classic Jira)
-    - "Blocks" link to the original issue
+    Links: "Blocks" link to the original issue
 
     Args:
         mcp: MCP client manager
         project_key: Jira project key
-        parent_key: Parent Feature key (for child relationship via link)
         issue_key: Original issue key (to block)
-        config: SDLC config dict
 
     Returns:
         Created issue key, or None on failure
     """
-    # Get link type from config (default for Classic Jira hierarchy)
-    jira_config = config.get("jira", {})
-    parent_link_type = jira_config.get("parent_link_type", "Parent")
-
-    # Format title with issue key
     summary = f"[REVIEW] {issue_key} Approve Architecture (HUMAN)"
 
     description = f"""Human review required before proceeding to development.
 
 This blocking Story must be marked as **Done** before the feature can progress.
 
-**Parent Feature:** {parent_key}
 **Blocked Issue:** {issue_key}
 
 ## Review Checklist
@@ -295,7 +315,6 @@ This blocking Story must be marked as **Done** before the feature can progress.
 """
 
     try:
-        # Create the review Story (without parent_key - Classic Jira doesn't support it for Stories)
         result = mcp.jira_create_issue(
             project_key=project_key,
             issue_type="Story",
@@ -303,7 +322,6 @@ This blocking Story must be marked as **Done** before the feature can progress.
             description=description,
         )
 
-        # Parse created issue key from result
         review_key = None
         if isinstance(result, str):
             key_match = re.search(r"([A-Z]+-\d+)", result)
@@ -315,17 +333,6 @@ This blocking Story must be marked as **Done** before the feature can progress.
             return None
 
         logger.info(f"Created review Story: {review_key}")
-
-        # Link review Story as child of parent Feature (Classic Jira hierarchy)
-        try:
-            mcp.jira_link_issues(
-                from_key=parent_key,
-                to_key=review_key,
-                link_type=parent_link_type,
-            )
-            logger.info(f"Linked {review_key} as child of {parent_key} (via '{parent_link_type}')")
-        except Exception as e:
-            logger.warning(f"Failed to create parent link: {e}")
 
         # Link review Story to block the original issue
         try:
@@ -345,169 +352,224 @@ This blocking Story must be marked as **Done** before the feature can progress.
         return None
 
 
-def build_decomposition_comment(result: DecompositionResult, parent_key: str, config: dict) -> str:
+def build_consolidated_adf_comment(
+    result: DecompositionResult,
+    parent_key: str,
+    execution_context: ExecutionContext,
+    plan_summary: Optional[str] = None,
+    issues: Optional[list[str]] = None,
+) -> dict:
     """
-    Build Technical Decomposition comment.
+    Build a single consolidated ADF comment for Analysis & Decomposition.
+
+    Produces one ADF document with expand blocks:
+    1. Context Summary (task info, documents, repo)
+    2. Technical Decomposition (native ADF table + story details)
+    3. Executor Rationale (CoT)
+    4. Clarification Questions (optional)
 
     Args:
-        result: DecompositionResult
+        result: DecompositionResult with stories, CoT, questions
         parent_key: Parent Feature key
-        config: SDLC config
+        execution_context: ExecutionContext for context summary
+        plan_summary: Optional work plan summary
+        issues: Optional non-blocking issues list
 
     Returns:
-        Markdown-formatted comment
+        ADF document dict ready for jira_add_comment_adf
     """
-    lines = [
-        "## Technical Decomposition",
-        "",
-        f"**Feature:** {parent_key} - {result.feature_title}",
-        f"**Complexity:** {result.complexity}",
-        "",
-        "---",
-        "",
-        "### Proposed Stories",
-        "",
-        "> **Note:** Stories documented for review. Will be created as Jira issues after architecture approval.",
-        "",
-    ]
+    from ..models.execution_context import ProjectStatus
+
+    content: list[dict] = []
+
+    # Title heading
+    content.append(MarkdownToADF._heading("AI Executor -- Analysis & Decomposition", 2))
+
+    # --- Expand 1: Context Summary ---
+    ctx_lines = [f"**Task:** {execution_context.jira.summary}", ""]
+    if execution_context.refined_confluence:
+        rc = execution_context.refined_confluence
+        ctx_lines.append(f"**Project Space:** {rc.project_space}")
+        ctx_lines.append(f"**Project Status:** {rc.project_status.value}")
+        ctx_lines.append("")
+
+        if rc.project_status in (
+            ProjectStatus.BRAND_NEW,
+            ProjectStatus.NEW_PROJECT,
+            ProjectStatus.INCOMPLETE,
+        ):
+            for item in rc.missing_critical_data or []:
+                ctx_lines.append(f"- {item}")
+            ctx_lines.append("")
+
+        if rc.core_documents:
+            ctx_lines.append("**Core Documents:**")
+            for doc in rc.core_documents:
+                ctx_lines.append(f"- [{doc.title}]({doc.url})")
+            ctx_lines.append("")
+
+        if rc.supporting_documents:
+            ctx_lines.append(f"**Supporting Documents ({len(rc.supporting_documents)}):**")
+            for doc in rc.supporting_documents:
+                ctx_lines.append(f"- [{doc.title}]({doc.url})")
+            ctx_lines.append("")
+
+    if execution_context.github and execution_context.github.repository_url:
+        ctx_lines.append(f"**Repository:** {execution_context.github.repository_url}")
+        if execution_context.github.primary_language:
+            ctx_lines.append(f"**Language:** {execution_context.github.primary_language}")
+        ctx_lines.append("")
+
+    if plan_summary:
+        ctx_lines.append("### Work Plan Summary")
+        ctx_lines.append("")
+        ctx_lines.append(plan_summary[:1500])
+        ctx_lines.append("")
+
+    if issues:
+        ctx_lines.append("### Notes")
+        for issue in issues:
+            ctx_lines.append(f"- {issue}")
+        ctx_lines.append("")
+
+    content.append(MarkdownToADF.expand_block("Context Summary", "\n".join(ctx_lines)))
+
+    # --- Expand 2: Technical Decomposition ---
+    decomp_nodes: list[dict] = []
+
+    # Feature info header
+    header_md = (
+        f"**Feature:** {parent_key} - {result.feature_title}\n"
+        f"**Complexity:** {result.complexity}\n"
+        f"**Overall Confidence:** {result.overall_confidence:.0%}\n\n"
+        "> Stories documented for review. Will be created as Jira issues "
+        "after architecture approval."
+    )
+    decomp_nodes.extend(MarkdownToADF.convert(header_md).get("content", []))
 
     if result.has_stories():
-        # Create table
-        lines.append("| # | Layer | Story Title | Specification |")
-        lines.append("|---|-------|-------------|---------------|")
-
+        # Native ADF table
+        headers = ["#", "Layer", "Story Title", "Confidence", "Specification"]
+        rows = []
         for story in result.stories:
-            # Truncate description for table
-            spec = story.description[:80] + "..." if len(story.description) > 80 else story.description
-            spec = spec.replace("\n", " ").replace("|", "\\|")
-            lines.append(f"| {story.order} | [{story.layer}] | {story.title} | {spec} |")
+            spec = (
+                story.description[:80] + "..."
+                if len(story.description) > 80
+                else story.description
+            )
+            spec = spec.replace("\n", " ")
+            conf_label = "HIGH" if story.confidence >= 0.7 else "LOW"
+            conf_str = f"{story.confidence:.0%} ({conf_label})"
+            rows.append(
+                [str(story.order), f"[{story.layer}]", story.title, conf_str, spec]
+            )
+        decomp_nodes.append(MarkdownToADF.table(headers, rows))
 
-        lines.append("")
-        lines.append("### Story Details")
-        lines.append("")
+        # Low confidence warnings
+        if result.low_confidence_stories:
+            warn_lines = [
+                "### Low Confidence Stories",
+                "",
+                "> The following stories may need additional review:",
+                "",
+            ]
+            for order in result.low_confidence_stories:
+                story = next((s for s in result.stories if s.order == order), None)
+                if story:
+                    warn_lines.append(f"- **Step {order}:** {story.title}")
+                    for flag in story.confidence_flags:
+                        warn_lines.append(f"  - {flag}")
+            decomp_nodes.extend(
+                MarkdownToADF.convert("\n".join(warn_lines)).get("content", [])
+            )
 
-        # Detailed specs per story
+        # Story details
+        details_lines = ["### Story Details", ""]
         for story in result.stories:
-            lines.append(f"#### [{story.layer}] {story.title}")
-            lines.append("")
+            details_lines.append(f"#### [{story.layer}] {story.title}")
+            details_lines.append(f"**Confidence:** {story.confidence:.0%}")
+            details_lines.append("")
             if story.files:
-                lines.append("**Files to modify:**")
+                details_lines.append("**Files to modify:**")
                 for f in story.files:
-                    lines.append(f"- `{f}`")
-                lines.append("")
+                    details_lines.append(f"- `{f}`")
+                details_lines.append("")
             if story.acceptance:
-                lines.append("**Acceptance Criteria:**")
-                lines.append(story.acceptance)
-                lines.append("")
+                details_lines.append("**Acceptance Criteria:**")
+                details_lines.append(story.acceptance)
+                details_lines.append("")
+            if story.depends_on:
+                deps_str = ", ".join(f"Step {d}" for d in story.depends_on)
+                details_lines.append(f"**Depends on:** {deps_str}")
+                details_lines.append("")
+        decomp_nodes.extend(
+            MarkdownToADF.convert("\n".join(details_lines)).get("content", [])
+        )
     else:
-        lines.append("*No stories extracted - manual planning required.*")
-        lines.append("")
+        decomp_nodes.extend(
+            MarkdownToADF.convert(
+                "*No stories extracted - manual planning required.*"
+            ).get("content", [])
+        )
 
-    lines.append("---")
-    lines.append("*Generated by AI Executor. Pending human review.*")
+    content.append({
+        "type": "expand",
+        "attrs": {"title": "Technical Decomposition"},
+        "content": decomp_nodes,
+    })
 
-    return "\n".join(lines)
+    # --- Expand 3: Executor Rationale ---
+    ctx_text = result.cot_context or "Task context not available"
+    if len(ctx_text) > 500:
+        ctx_text = ctx_text[:500] + "..."
+    decision_text = result.cot_decision or "Technical approach not specified"
+    if len(decision_text) > 1000:
+        decision_text = decision_text[:1000] + "..."
 
-
-def build_cot_comment(result: DecompositionResult, config: dict) -> str:
-    """
-    Build Chain of Thoughts comment using format_cot_panel().
-
-    Args:
-        result: DecompositionResult with CoT fields
-        config: SDLC config
-
-    Returns:
-        Formatted CoT panel
-    """
-    # Build context from understanding
-    context = result.cot_context if result.cot_context else "Task context not available"
-    # Truncate if too long
-    if len(context) > 500:
-        context = context[:500] + "..."
-
-    # Build decision from analysis
-    decision = result.cot_decision if result.cot_decision else "Technical approach not specified"
-    if len(decision) > 1000:
-        decision = decision[:1000] + "..."
-
-    # Alternatives (may be empty)
-    alternatives = result.cot_alternatives
-
-    return format_cot_panel(
-        context=context,
-        decision=decision,
-        alternatives=alternatives,
-    )
-
-
-def build_clarifications_comment(
-    result: DecompositionResult,
-    issue_key: str,
-    slug: str,
-    config: dict,
-) -> Optional[str]:
-    """
-    Build Clarification Questions comment.
-
-    Only returns content if there are questions.
-
-    Args:
-        result: DecompositionResult with questions
-        issue_key: Jira issue key
-        slug: Project slug for header
-        config: SDLC config
-
-    Returns:
-        Formatted comment, or None if no questions
-    """
-    if not result.has_questions():
-        return None
-
-    # Use format_draft_comment_header for the header
-    header = f"### need clarification: {issue_key}_{slug}_story.md"
-
-    lines = [
-        header,
+    cot_lines = [
+        f"**Context:** {ctx_text}",
         "",
-        "The following questions require human input before proceeding:",
-        "",
+        f"**Decision:** {decision_text}",
     ]
+    if result.cot_alternatives:
+        cot_lines.append("")
+        cot_lines.append(f"**Alternatives Discarded:** {result.cot_alternatives}")
 
-    # Group questions by related story
-    general_questions = []
-    story_questions: dict[str, list[ClarificationQuestion]] = {}
+    content.append(MarkdownToADF.expand_block("Executor Rationale", "\n".join(cot_lines)))
 
-    for q in result.questions:
-        if q.related_story:
-            if q.related_story not in story_questions:
-                story_questions[q.related_story] = []
-            story_questions[q.related_story].append(q)
-        else:
-            general_questions.append(q)
+    # --- Expand 4: Clarification Questions (optional) ---
+    if result.has_questions():
+        q_lines = ["The following questions require human input:", ""]
+        general_questions = [q for q in result.questions if not q.related_story]
+        story_questions: dict[str, list[ClarificationQuestion]] = {}
+        for q in result.questions:
+            if q.related_story:
+                story_questions.setdefault(q.related_story, []).append(q)
 
-    # Add general questions
-    if general_questions:
-        lines.append("#### General")
-        lines.append("")
-        for i, q in enumerate(general_questions, 1):
-            lines.append(f"{i}. **{q.question}**")
-            if q.context and q.context != "From concerns section":
-                lines.append(f"   - Context: {q.context}")
-        lines.append("")
+        if general_questions:
+            q_lines.append("#### General")
+            q_lines.append("")
+            for i, q in enumerate(general_questions, 1):
+                q_lines.append(f"{i}. **{q.question}**")
+                if q.context and q.context != "From concerns section":
+                    q_lines.append(f"   - Context: {q.context}")
+            q_lines.append("")
 
-    # Add story-specific questions
-    for story_title, questions in story_questions.items():
-        lines.append(f"#### Related to {story_title}")
-        lines.append("")
-        for i, q in enumerate(questions, 1):
-            lines.append(f"{i}. **{q.question}**")
-        lines.append("")
+        for story_title, questions in story_questions.items():
+            q_lines.append(f"#### Related to {story_title}")
+            q_lines.append("")
+            for i, q in enumerate(questions, 1):
+                q_lines.append(f"{i}. **{q.question}**")
+            q_lines.append("")
 
-    lines.append("---")
-    lines.append("*Please respond in comments or update the Feature description.*")
+        content.append(
+            MarkdownToADF.expand_block("Clarification Questions", "\n".join(q_lines))
+        )
 
-    return "\n".join(lines)
+    # Footer
+    content.append(MarkdownToADF._paragraph("Generated by AI Executor. Pending human review."))
+
+    return {"type": "doc", "version": 1, "content": content}
 
 
 def handle_analysis_decomposition(
@@ -520,11 +582,8 @@ def handle_analysis_decomposition(
     """
     Handle the Analysis & Decomposition stage.
 
-    Creates Jira artifacts:
-    1. Blocking review Story (child of Feature, blocks original issue)
-    2. Technical Decomposition comment
-    3. Executor Rationale (CoT) comment
-    4. Clarification Questions comment (optional)
+    Creates blocking review Story and parses LLM response.
+    The consolidated ADF comment is built and posted by handle_post_execution().
 
     Args:
         mcp: MCP client manager
@@ -538,31 +597,23 @@ def handle_analysis_decomposition(
     """
     logger.info(f"Analysis & Decomposition for {issue_key}")
 
-    # Parse LLM response
+    # Parse LLM response (with confidence scoring)
     result = parse_llm_response(
         response=llm_response,
         issue_key=issue_key,
         feature_title=execution_context.jira.summary,
+        execution_context=execution_context,
     )
 
     logger.info(f"Parsed {len(result.stories)} stories, {len(result.questions)} questions")
 
-    # Get parent key (Feature key for Story hierarchy)
-    # The issue being processed is usually a Feature, so parent_key is the issue_key itself
-    # But if it's a Story, we need the parent Feature key
-    parent_key = execution_context.jira.parent_key or issue_key
     project_key = execution_context.jira.project_key
 
-    # Generate slug from feature title
-    slug = re.sub(r"[^a-z0-9]+", "_", execution_context.jira.summary.lower())[:30].strip("_")
-
-    # 1. Create blocking review task
+    # Create blocking review task
     review_task_key = create_blocking_review_task(
         mcp=mcp,
         project_key=project_key,
-        parent_key=parent_key,
         issue_key=issue_key,
-        config=config,
     )
     result.review_task_key = review_task_key
 
@@ -570,31 +621,6 @@ def handle_analysis_decomposition(
         logger.info(f"Created review task: {review_task_key}")
     else:
         logger.warning("Failed to create review task")
-
-    # 2. Add Technical Decomposition comment
-    decomposition_comment = build_decomposition_comment(result, parent_key, config)
-    try:
-        mcp.jira_add_comment(issue_key, decomposition_comment)
-        logger.info(f"Added decomposition comment to {issue_key}")
-    except Exception as e:
-        logger.error(f"Failed to add decomposition comment: {e}")
-
-    # 3. Add Executor Rationale (CoT) comment
-    cot_comment = build_cot_comment(result, config)
-    try:
-        mcp.jira_add_comment(issue_key, cot_comment)
-        logger.info(f"Added CoT comment to {issue_key}")
-    except Exception as e:
-        logger.error(f"Failed to add CoT comment: {e}")
-
-    # 4. Add Clarification Questions comment (if any)
-    clarifications_comment = build_clarifications_comment(result, issue_key, slug, config)
-    if clarifications_comment:
-        try:
-            mcp.jira_add_comment(issue_key, clarifications_comment)
-            logger.info(f"Added clarifications comment to {issue_key}")
-        except Exception as e:
-            logger.error(f"Failed to add clarifications comment: {e}")
 
     logger.info(f"Analysis & Decomposition complete for {issue_key}")
     return result

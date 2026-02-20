@@ -12,6 +12,9 @@ confluence:
   sdlc_rules_page_title: "SDLC Rules"
   product_registry_title: "Product Registry"
 
+  # Space containing shared Templates folder (fallback if not in project space)
+  # templates_space: "PM"
+
   # SSOT Doctrine
   ssot_role: "State"  # Architecture, Contracts, Logic
 

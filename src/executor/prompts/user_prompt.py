@@ -1,6 +1,9 @@
 """User prompt builder for LLM execution."""
 
+from typing import Optional
+
 from ..models.execution_context import ExecutionContext, ProjectStatus
+from .template_compliance import build_template_compliance_section
 
 
 def build_user_prompt(context: ExecutionContext) -> str:
@@ -15,7 +18,15 @@ def build_user_prompt(context: ExecutionContext) -> str:
     """
     prompt_context = context.build_prompt_context()
 
-    # Check if this is a brand-new project
+    # Check if this project needs documentation setup
+    needs_doc_setup = (
+        context.refined_confluence
+        and context.refined_confluence.project_status in (
+            ProjectStatus.BRAND_NEW,
+            ProjectStatus.NEW_PROJECT,
+            ProjectStatus.INCOMPLETE,
+        )
+    )
     is_brand_new = (
         context.refined_confluence
         and context.refined_confluence.project_status == ProjectStatus.BRAND_NEW
@@ -41,16 +52,25 @@ def build_user_prompt(context: ExecutionContext) -> str:
 4. Create a step-by-step work plan aligned with existing architecture
 5. Evaluate the Definition of Ready"""
 
-    # Add brand-new project specific instructions
-    if is_brand_new:
-        task_instructions += """
+    # Add documentation setup instructions for projects with gaps
+    if needs_doc_setup:
+        missing = context.refined_confluence.missing_critical_data or []
+        missing_text = "\n".join(f"- {item}" for item in missing) if missing else "- Project Passport\n- Logical Architecture"
 
-**CRITICAL - NEW PROJECT SETUP:**
-This is a brand-new project with no existing Confluence documentation.
-Your work plan MUST begin with documentation steps:
-- Create Project Passport page (Layer: DOCS)
-- Create Logical Architecture page (Layer: DOCS)
+        task_instructions += f"""
+
+**CRITICAL - PROJECT DOCUMENTATION SETUP:**
+This project has documentation gaps that must be addressed.
+
+Documentation gaps:
+{missing_text}
+
+Your work plan MUST include steps to create or fill these pages (Layer: DOCS).
 These documentation steps MUST be completed BEFORE any implementation steps."""
+
+    # Add template compliance instructions if templates are available
+    if context.confluence_templates:
+        task_instructions += build_template_compliance_section(context.confluence_templates)
 
     return f"""Analyze the following task and create a detailed work plan.
 
@@ -64,4 +84,64 @@ These documentation steps MUST be completed BEFORE any implementation steps."""
 
 Follow the output format specified in your instructions exactly.
 If any required information is missing, clearly mark it as `[DATA MISSING: description]`.
+"""
+
+
+def build_refinement_prompt(
+    context: ExecutionContext,
+    feedback: str,
+    previous_plan: str,
+    version: int = 2,
+) -> str:
+    """
+    Build a refinement prompt that incorporates human feedback on a previous plan.
+
+    Args:
+        context: Original ExecutionContext (loaded from context store)
+        feedback: Human feedback describing changes to make
+        previous_plan: The previous work plan text
+        version: Refinement version number (2, 3, ...)
+
+    Returns:
+        Formatted refinement prompt string
+    """
+    prompt_context = context.build_prompt_context()
+
+    return f"""You are refining an existing work plan (version {version}) based on human feedback.
+
+## Original Task Context
+
+{prompt_context}
+
+---
+
+## Previous Work Plan (v{version - 1})
+
+{previous_plan}
+
+---
+
+## Human Feedback
+
+{feedback}
+
+---
+
+## Your Task
+
+Incorporate the human feedback into the work plan. Specifically:
+
+1. **Re-read** the original task context above
+2. **Review** the previous work plan
+3. **Apply** the requested changes from human feedback
+4. **Regenerate** a complete, updated work plan
+
+**Important:**
+- Keep all sections from the original format (Understanding, Concerns, Analysis, Work Plan, Definition of Ready)
+- Only modify sections affected by the feedback — preserve unchanged parts
+- In the Work Plan, maintain proper step numbering, Layers, Files, Acceptance, and Depends on fields
+- If the feedback requests adding/removing/splitting steps, update all step numbers and dependencies accordingly
+- Mark this as "Refined Plan v{version}" in your Understanding section
+
+Follow the output format specified in your instructions exactly.
 """

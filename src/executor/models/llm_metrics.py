@@ -1,5 +1,6 @@
 """LLM usage metrics tracking for the execution pipeline."""
 
+import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
@@ -135,3 +136,145 @@ class ExecutionMetrics:
                 lines.append("")
 
         return "\n".join(lines)
+
+
+@dataclass
+class StageMetrics:
+    """Metrics for a single pipeline stage."""
+
+    stage_name: str
+    duration_ms: int = 0
+    success: bool = True
+    error: Optional[str] = None
+    metadata: dict = field(default_factory=dict)
+
+
+@dataclass
+class PipelineMetrics:
+    """Full pipeline metrics covering all stages."""
+
+    issue_key: str = ""
+    start_time: datetime = field(default_factory=datetime.now)
+    end_time: Optional[datetime] = None
+
+    # Per-stage metrics
+    stages: list[StageMetrics] = field(default_factory=list)
+
+    # LLM-specific metrics (from Stage 5)
+    llm_metrics: Optional[ExecutionMetrics] = None
+
+    # Validation stats
+    validation_pass: bool = False
+    validation_errors: int = 0
+    validation_warnings: int = 0
+
+    # Story stats
+    stories_extracted: int = 0
+    stories_created: int = 0
+
+    # Confidence
+    overall_confidence: float = 0.0
+
+    def add_stage(self, stage: StageMetrics) -> None:
+        """Add a completed stage to the metrics."""
+        self.stages.append(stage)
+
+    def finalize(self) -> None:
+        """Mark pipeline as complete."""
+        self.end_time = datetime.now()
+
+    @property
+    def total_duration_ms(self) -> int:
+        """Total pipeline duration in milliseconds."""
+        if self.end_time:
+            return int((self.end_time - self.start_time).total_seconds() * 1000)
+        return sum(s.duration_ms for s in self.stages)
+
+    def to_markdown(self) -> str:
+        """Format pipeline metrics as markdown."""
+        lines = [
+            f"# Pipeline Metrics: {self.issue_key}",
+            "",
+            f"Generated: {datetime.now().isoformat()}",
+            f"Total Duration: {self.total_duration_ms / 1000:.1f}s",
+            "",
+            "## Pipeline Summary",
+            "",
+            "| Metric | Value |",
+            "|--------|-------|",
+            f"| Issue Key | {self.issue_key} |",
+            f"| Total Duration | {self.total_duration_ms / 1000:.1f}s |",
+            f"| Stages | {len(self.stages)} |",
+            f"| Validation Passed | {'Yes' if self.validation_pass else 'No'} |",
+            f"| Validation Errors | {self.validation_errors} |",
+            f"| Validation Warnings | {self.validation_warnings} |",
+            f"| Stories Extracted | {self.stories_extracted} |",
+            f"| Stories Created | {self.stories_created} |",
+            f"| Overall Confidence | {self.overall_confidence:.0%} |",
+            "",
+            "## Stage Breakdown",
+            "",
+            "| Stage | Duration | Status | Details |",
+            "|-------|----------|--------|---------|",
+        ]
+
+        for stage in self.stages:
+            status = "OK" if stage.success else "FAILED"
+            details = stage.error or ""
+            if stage.metadata:
+                meta_parts = [f"{k}={v}" for k, v in stage.metadata.items()]
+                details = ", ".join(meta_parts)
+            lines.append(
+                f"| {stage.stage_name} | {stage.duration_ms / 1000:.1f}s | "
+                f"{status} | {details} |"
+            )
+
+        # Include LLM metrics if available
+        if self.llm_metrics:
+            lines.extend([
+                "",
+                "## LLM Metrics",
+                "",
+                "| Metric | Value |",
+                "|--------|-------|",
+                f"| Total Tokens | {self.llm_metrics.total_tokens:,} |",
+                f"| Tokens In | {self.llm_metrics.total_tokens_in:,} |",
+                f"| Tokens Out | {self.llm_metrics.total_tokens_out:,} |",
+                f"| Retries | {self.llm_metrics.retry_count} |",
+                f"| Max Retries Hit | {'Yes' if self.llm_metrics.max_retries_hit else 'No'} |",
+            ])
+
+        return "\n".join(lines)
+
+    def to_json(self) -> dict:
+        """Export pipeline metrics as JSON dict."""
+        return {
+            "issue_key": self.issue_key,
+            "start_time": self.start_time.isoformat(),
+            "end_time": self.end_time.isoformat() if self.end_time else None,
+            "total_duration_ms": self.total_duration_ms,
+            "validation": {
+                "passed": self.validation_pass,
+                "errors": self.validation_errors,
+                "warnings": self.validation_warnings,
+            },
+            "stories": {
+                "extracted": self.stories_extracted,
+                "created": self.stories_created,
+                "overall_confidence": self.overall_confidence,
+            },
+            "stages": [
+                {
+                    "name": s.stage_name,
+                    "duration_ms": s.duration_ms,
+                    "success": s.success,
+                    "error": s.error,
+                    "metadata": s.metadata,
+                }
+                for s in self.stages
+            ],
+            "llm": {
+                "total_tokens": self.llm_metrics.total_tokens if self.llm_metrics else 0,
+                "retries": self.llm_metrics.retry_count if self.llm_metrics else 0,
+            },
+        }

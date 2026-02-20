@@ -352,6 +352,12 @@ class MCPClientManager:
             "jira_add_comment", {"issue_key": issue_key, "body": body}
         )
 
+    def jira_add_comment_adf(self, issue_key: str, adf_body: dict) -> str:
+        """Add comment to Jira issue using pre-built ADF content."""
+        return self.clients["jira"].call_tool(
+            "jira_add_comment_adf", {"issue_key": issue_key, "adf_body": adf_body}
+        )
+
     def jira_transition_issue(self, issue_key: str, transition_name: str) -> str:
         """Transition Jira issue."""
         return self.clients["jira"].call_tool(
@@ -362,6 +368,12 @@ class MCPClientManager:
         """Get comments for a Jira issue."""
         return self.clients["jira"].call_tool(
             "jira_get_comments", {"issue_key": issue_key}
+        )
+
+    def jira_update_description(self, issue_key: str, adf_body: dict) -> str:
+        """Update Jira issue description with pre-built ADF content."""
+        return self.clients["jira"].call_tool(
+            "jira_update_description", {"issue_key": issue_key, "adf_body": adf_body}
         )
 
     def jira_create_issue(

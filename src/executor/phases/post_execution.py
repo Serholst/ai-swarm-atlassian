@@ -91,11 +91,18 @@ def determine_outcome(
             # Fall through to SUCCESS check (don't return early)
 
         # NEW_PROJECT status means folder exists but mandatory docs are missing
+        # Treat the same as BRAND_NEW: proceed to LLM with missing data as context
         elif rc.project_status == ProjectStatus.NEW_PROJECT:
             issues.extend(rc.missing_critical_data)
-            return ExecutionOutcome.NEW_PROJECT, issues
+            # Fall through to SUCCESS check (don't return early)
 
-        # Check for missing critical data even if not NEW_PROJECT/BRAND_NEW
+        # INCOMPLETE status means pages exist but are empty or lack content
+        # Proceed to LLM which will generate steps to fill them
+        elif rc.project_status == ProjectStatus.INCOMPLETE:
+            issues.extend(rc.missing_critical_data)
+            # Fall through to SUCCESS check (don't return early)
+
+        # Check for missing critical data even if not NEW_PROJECT/BRAND_NEW/INCOMPLETE
         elif rc.missing_critical_data:
             issues.extend(rc.missing_critical_data)
 
@@ -109,84 +116,6 @@ def determine_outcome(
         return ExecutionOutcome.SUCCESS, issues
 
     return ExecutionOutcome.CONTEXT_ERROR, issues
-
-
-def build_success_comment(
-    execution_context: ExecutionContext,
-    plan_summary: Optional[str] = None,
-    issues: Optional[list[str]] = None,
-) -> str:
-    """
-    Build comment for successful execution.
-
-    Args:
-        execution_context: The execution context
-        plan_summary: Optional summary of the generated plan
-        issues: Any non-blocking issues to note
-
-    Returns:
-        Markdown-formatted comment
-    """
-    lines = [
-        "## AI Executor - Context Gathered Successfully",
-        "",
-        f"**Task:** {execution_context.jira.summary}",
-        "",
-    ]
-
-    # Add Confluence context summary
-    if execution_context.refined_confluence:
-        rc = execution_context.refined_confluence
-        lines.append(f"**Project Space:** {rc.project_space}")
-        lines.append(f"**Project Status:** {rc.project_status.value}")
-        lines.append("")
-
-        # Brand-new project signal
-        if rc.project_status == ProjectStatus.BRAND_NEW:
-            lines.append("### New Project Setup Required")
-            lines.append("")
-            lines.append("This is a brand-new project. The work plan includes:")
-            lines.append("- Creating Project Passport in Confluence")
-            lines.append("- Creating Logical Architecture in Confluence")
-            lines.append("")
-
-        if rc.core_documents:
-            lines.append("### Core Documents Retrieved")
-            for doc in rc.core_documents:
-                lines.append(f"- [{doc.title}]({doc.url})")
-            lines.append("")
-
-        if rc.supporting_documents:
-            lines.append(f"### Supporting Documents ({len(rc.supporting_documents)})")
-            for doc in rc.supporting_documents:
-                lines.append(f"- [{doc.title}]({doc.url})")
-            lines.append("")
-
-    # Add GitHub context if available
-    if execution_context.github and execution_context.github.repository_url:
-        lines.append(f"**Repository:** {execution_context.github.repository_url}")
-        if execution_context.github.primary_language:
-            lines.append(f"**Language:** {execution_context.github.primary_language}")
-        lines.append("")
-
-    # Add plan summary if provided
-    if plan_summary:
-        lines.append("### Work Plan Summary")
-        lines.append("")
-        lines.append(plan_summary[:1500])  # Limit length
-        lines.append("")
-
-    # Note any non-blocking issues
-    if issues:
-        lines.append("### Notes")
-        for issue in issues:
-            lines.append(f"- {issue}")
-        lines.append("")
-
-    lines.append("---")
-    lines.append("*Ready for human review.*")
-
-    return "\n".join(lines)
 
 
 def build_failure_comment(
@@ -279,11 +208,11 @@ def handle_post_execution(
     - Moving successful executions to Human Plan Review
     - Moving failed/insufficient context to Backlog
 
-    On SUCCESS, also executes Analysis & Decomposition:
-    - Creates blocking review Story
-    - Adds Technical Decomposition comment
-    - Adds Executor Rationale (CoT) comment
-    - Adds Clarification Questions comment (if any)
+    On SUCCESS: executes Analysis & Decomposition and posts a single
+    consolidated ADF comment with expand blocks (context, decomposition,
+    rationale, clarifications).
+
+    On FAILURE: posts a Markdown failure comment.
 
     Args:
         mcp: MCP client manager
@@ -304,39 +233,32 @@ def handle_post_execution(
     outcome, issues = determine_outcome(execution_context, execution_error)
     logger.info(f"Outcome: {outcome.value}, issues: {issues}")
 
-    # Determine target status and build comment
     decomposition_result: Optional[DecompositionResult] = None
 
     if outcome == ExecutionOutcome.SUCCESS:
         target_status = STATUS_HUMAN_PLAN_REVIEW
-        comment = build_success_comment(execution_context, plan_summary, issues if issues else None)
     else:
         target_status = STATUS_BACKLOG
-        jira_summary = execution_context.jira.summary if execution_context else None
-        comment = build_failure_comment(issue_key, outcome, issues, jira_summary)
 
     logger.info(f"Target status: {target_status}")
 
     if dry_run:
         logger.info(f"[DRY-RUN] Would transition {issue_key} to '{target_status}'")
-        logger.info(f"[DRY-RUN] Would add comment:\n{comment[:500]}...")
         return TransitionResult(
             outcome=outcome,
             target_status=target_status,
             comment_added=False,
         )
 
-    # Add comment and transition
     try:
-        # Add success comment first (so it's visible even if decomposition/transition fails)
-        mcp.jira_add_comment(issue_key, comment)
-        logger.info(f"Added comment to {issue_key}")
-
-        # On SUCCESS: Execute Analysis & Decomposition
         if outcome == ExecutionOutcome.SUCCESS and llm_response and execution_context and config:
+            # Execute Analysis & Decomposition (creates review task, parses response)
             logger.info(f"Executing Analysis & Decomposition for {issue_key}")
             try:
-                from .decomposition import handle_analysis_decomposition
+                from .decomposition import (
+                    handle_analysis_decomposition,
+                    build_consolidated_adf_comment,
+                )
 
                 decomposition_result = handle_analysis_decomposition(
                     mcp=mcp,
@@ -345,10 +267,33 @@ def handle_post_execution(
                     llm_response=llm_response,
                     config=config,
                 )
-                logger.info(f"Decomposition complete: {len(decomposition_result.stories)} stories, review_task={decomposition_result.review_task_key}")
+                logger.info(
+                    f"Decomposition complete: {len(decomposition_result.stories)} stories, "
+                    f"review_task={decomposition_result.review_task_key}"
+                )
+
+                # Build and post single consolidated ADF comment
+                parent_key = execution_context.jira.parent_key or issue_key
+                adf_comment = build_consolidated_adf_comment(
+                    result=decomposition_result,
+                    parent_key=parent_key,
+                    execution_context=execution_context,
+                    plan_summary=plan_summary,
+                    issues=issues if issues else None,
+                )
+                mcp.jira_add_comment_adf(issue_key, adf_comment)
+                logger.info(f"Added consolidated ADF comment to {issue_key}")
+
             except Exception as decomp_error:
-                logger.error(f"Decomposition failed (continuing with transition): {decomp_error}")
-                # Don't fail the whole post-execution, just log the error
+                logger.error(
+                    f"Decomposition/comment failed (continuing with transition): {decomp_error}"
+                )
+        else:
+            # Non-SUCCESS: post failure comment as Markdown
+            jira_summary = execution_context.jira.summary if execution_context else None
+            comment = build_failure_comment(issue_key, outcome, issues, jira_summary)
+            mcp.jira_add_comment(issue_key, comment)
+            logger.info(f"Added failure comment to {issue_key}")
 
         # Transition to target status
         mcp.jira_transition_issue(issue_key, target_status)

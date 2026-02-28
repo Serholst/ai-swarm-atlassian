@@ -415,11 +415,16 @@ def build_jira_description_adf(
     # --- Divider ---
     content.append(_ADF.rule())
 
-    # --- Questions / Clarifications (VISIBLE — NOT in Expand) ---
-    questions_md = _format_questions_markdown(response.clarification_questions) if response.clarification_questions else ""
+    # --- Questions reference (questions are posted as a separate comment) ---
+    questions_md = (
+        _format_questions_markdown(response.clarification_questions)
+        if response.clarification_questions
+        else ""
+    )
     if questions_md:
-        content.append(_ADF.heading("Questions / Clarifications Needed", 3))
-        content.extend(_ADF.markdown_to_nodes(questions_md))
+        content.append(_ADF.paragraph(
+            "*Clarification questions have been posted as a comment on this issue.*"
+        ))
         content.append(_ADF.rule())
 
     # --- Expand: Original Requirements ---
@@ -613,7 +618,11 @@ def execute_phase_zero(
         )
 
     # --- Step 1a: Auto-detect Phase 0.5 (feedback incorporation) ---
-    from .context_builder import has_existing_phase0_analysis, extract_assignee_feedback
+    from .context_builder import (
+        has_existing_phase0_analysis,
+        extract_assignee_feedback,
+        find_phase0_questions_timestamp,
+    )
 
     if has_existing_phase0_analysis(execution_context):
         logger.info("Phase 0: Existing Phase 0 analysis detected — checking for assignee feedback")
@@ -631,14 +640,18 @@ def execute_phase_zero(
         previous_analysis = _load_previous_phase0_xml(previous_output_file)
 
         if assignee_id and previous_analysis:
-            # Get the Phase 0 output file's modification time as the timestamp gate
-            phase0_timestamp = None
-            if previous_output_file.exists():
+            # Prefer the questions comment timestamp as the anchor for feedback detection
+            phase0_timestamp = find_phase0_questions_timestamp(mcp, issue_key)
+            if phase0_timestamp:
+                logger.info(f"Phase 0: Using questions comment timestamp: {phase0_timestamp}")
+            elif previous_output_file.exists():
+                # Fallback: use output file mtime (backward compatibility)
                 from datetime import timezone
                 mtime = previous_output_file.stat().st_mtime
                 phase0_timestamp = datetime.fromtimestamp(
                     mtime, tz=timezone.utc
                 ).strftime("%Y-%m-%dT%H:%M:%S")
+                logger.info(f"Phase 0: Fallback to file mtime timestamp: {phase0_timestamp}")
 
             assignee_feedback = extract_assignee_feedback(
                 mcp=mcp,
@@ -777,6 +790,30 @@ def execute_phase_zero(
             logger.info(f"Phase 0: Jira description updated for {issue_key}")
         except Exception as e:
             logger.error(f"Phase 0: Failed to update Jira description: {e}")
+
+    # --- Step 6a: Post clarification questions as a separate comment ---
+    questions_md = (
+        _format_questions_markdown(response.clarification_questions)
+        if response.clarification_questions
+        else ""
+    )
+    if not dry_run and questions_md:
+        questions_comment_md = (
+            f"## Phase 0: Clarification Questions | {issue_key}\n\n"
+            f"The following questions need to be answered before this issue "
+            f"can proceed:\n\n{questions_md}\n\n"
+            f"---\n*Please reply in a new comment below.*"
+        )
+        questions_adf = {
+            "type": "doc",
+            "version": 1,
+            "content": _ADF.markdown_to_nodes(questions_comment_md),
+        }
+        try:
+            mcp.jira_add_comment_adf(issue_key, questions_adf)
+            logger.info(f"Phase 0: Posted clarification questions comment on {issue_key}")
+        except Exception as e:
+            logger.warning(f"Phase 0: Failed to post questions comment: {e}")
 
     # Determine if DoR is met (no validation errors + no BLOCKING questions)
     has_blocking = bool(

@@ -671,7 +671,7 @@ def create_stories_pipeline(task_input: str, output_dir: str = "outputs") -> int
         has_deps = any(story.depends_on for story, _ in created)
         if has_deps:
             console.print(f"\n[bold]Step 4: Creating dependency links[/bold]")
-            dep_count = create_dependency_links(mcp, created)
+            dep_count = create_dependency_links(mcp, created, config.model_dump())
             console.print(f"  [green]✓[/green] Created {dep_count} dependency links")
 
         # Report results

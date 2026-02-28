@@ -17,6 +17,25 @@ from enum import Enum
 if TYPE_CHECKING:
     from .github_models import GitHubContext  # noqa: F401
 
+# Content budget defaults (chars) for Confluence document truncation
+CORE_DOC_MAX_CHARS = 12000
+SUPPORTING_DOC_MAX_CHARS = 6000
+
+
+def _truncate_document(content: str, max_chars: int, url: str = "") -> str:
+    """Truncate document content on a paragraph boundary within the char budget."""
+    if len(content) <= max_chars:
+        return content
+
+    # Find the last paragraph break before the limit
+    truncated = content[:max_chars]
+    last_break = truncated.rfind("\n\n")
+    if last_break > max_chars // 2:
+        truncated = truncated[:last_break]
+
+    suffix = f"\n\n[... truncated — full document: {url}]" if url else "\n\n[... truncated]"
+    return truncated.rstrip() + suffix
+
 
 class ProjectStatus(Enum):
     """Project status based on documentation state."""
@@ -377,7 +396,9 @@ class ExecutionContext:
                     sections.append(f"#### {doc.title}")
                     sections.append(f"URL: {doc.url}")
                     sections.append("")
-                    sections.append(doc.content)
+                    sections.append(
+                        _truncate_document(doc.content, CORE_DOC_MAX_CHARS, doc.url)
+                    )
                     sections.append("")
 
             # Supporting documents (Discovery Path)
@@ -388,7 +409,9 @@ class ExecutionContext:
                     sections.append(f"#### {doc.title}")
                     sections.append(f"URL: {doc.url}")
                     sections.append("")
-                    sections.append(doc.content)
+                    sections.append(
+                        _truncate_document(doc.content, SUPPORTING_DOC_MAX_CHARS, doc.url)
+                    )
                     sections.append("")
 
             # Retrieval errors

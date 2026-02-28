@@ -495,3 +495,111 @@ def get_validation_warnings(results: dict[str, ValidationResult]) -> list[str]:
         for warning in result.warnings:
             warnings.append(f"[{section_name}] {warning}")
     return warnings
+
+
+# =============================================================================
+# Regex-based post-processing (avoids LLM retry for simple formatting fixes)
+# =============================================================================
+
+# Keywords → layer inference map (lowercase)
+_LAYER_KEYWORDS: dict[str, str] = {
+    "test": "QA", "tests": "QA", "e2e": "QA", "integration test": "QA",
+    "automation": "QA", "spec": "QA",
+    "migrat": "DB", "schema": "DB", "sql": "DB", "database": "DB",
+    "deploy": "INFRA", "terraform": "INFRA", "k8s": "INFRA", "kubernetes": "INFRA",
+    "ci/cd": "INFRA", "pipeline": "INFRA", "docker": "INFRA", "helm": "INFRA",
+    "document": "DOCS", "readme": "DOCS", "confluence": "DOCS", "wiki": "DOCS",
+    "ui": "FE", "frontend": "FE", "component": "FE", "css": "FE", "react": "FE",
+    "api": "BE", "endpoint": "BE", "service": "BE", "backend": "BE",
+    "controller": "BE", "handler": "BE", "worker": "BE",
+}
+
+
+def _infer_layer(step_description: str) -> str:
+    """Infer a layer code from step description keywords."""
+    desc_lower = step_description.lower()
+    for keyword, layer in _LAYER_KEYWORDS.items():
+        if keyword in desc_lower:
+            return layer
+    return "GEN"
+
+
+def regex_fix_work_plan(work_plan: str, errors: list[str]) -> tuple[str, list[str]]:
+    """
+    Attempt regex-based fixes for common validation errors before burning an LLM retry.
+
+    Handles:
+    - Missing **Layer:** fields (inferred from step description keywords)
+    - Missing **Files:** fields (inserted with placeholder)
+    - Missing **Acceptance:** fields (inserted with placeholder)
+
+    Args:
+        work_plan: The raw work plan text from LLM response
+        errors: List of validation error strings
+
+    Returns:
+        Tuple of (possibly fixed work plan, list of remaining unfixed errors)
+    """
+    if not work_plan or not errors:
+        return work_plan, errors
+
+    fixed = work_plan
+    remaining_errors = []
+
+    for error in errors:
+        if "Missing Layer" in error or "Missing **Layer:**" in error:
+            # Find steps missing Layer and insert one
+            fixed = _insert_missing_layers(fixed)
+        elif "Missing **Files:**" in error or "Files field is empty" in error:
+            fixed = _insert_missing_field(fixed, "Files", "[To be determined]")
+        elif "Missing **Acceptance:**" in error or "Acceptance field is empty" in error:
+            fixed = _insert_missing_field(fixed, "Acceptance", "[To be defined]")
+        else:
+            remaining_errors.append(error)
+
+    return fixed, remaining_errors
+
+
+def _insert_missing_layers(work_plan: str) -> str:
+    """Insert Layer tags into steps that are missing them."""
+    step_pattern = re.compile(
+        r"(-\s*\[\s*\]\s*\*\*Step\s+\d+:\*\*\s*)(.+?)(?=(?:-\s*\[\s*\]\s*\*\*Step|\Z))",
+        re.DOTALL | re.IGNORECASE,
+    )
+
+    def _fix_step(match: re.Match) -> str:
+        header = match.group(1)
+        body = match.group(2)
+        if re.search(r"\*\*Layer:\*\*", body, re.IGNORECASE):
+            return match.group(0)  # Already has Layer
+        # Infer layer from description
+        desc_line = body.split("\n")[0].strip()
+        layer = _infer_layer(desc_line)
+        # Insert Layer as first sub-field
+        indent = "  "
+        return f"{header}{desc_line}\n{indent}- **Layer:** {layer}\n{indent}" + "\n".join(
+            line for line in body.split("\n")[1:]
+        )
+
+    return step_pattern.sub(_fix_step, work_plan)
+
+
+def _insert_missing_field(work_plan: str, field_name: str, placeholder: str) -> str:
+    """Insert a missing field into steps that lack it."""
+    step_pattern = re.compile(
+        r"(-\s*\[\s*\]\s*\*\*Step\s+\d+:\*\*\s*.+?)(?=(?:-\s*\[\s*\]\s*\*\*Step|\Z))",
+        re.DOTALL | re.IGNORECASE,
+    )
+
+    def _fix_step(match: re.Match) -> str:
+        block = match.group(0)
+        field_re = re.compile(rf"\*\*{field_name}:\*\*", re.IGNORECASE)
+        if field_re.search(block):
+            return block  # Already has field
+        # Insert before the last line of the block
+        lines = block.rstrip().split("\n")
+        indent = "  "
+        lines.append(f"{indent}- **{field_name}:** {placeholder}")
+        return "\n".join(lines) + "\n"
+
+    return step_pattern.sub(_fix_step, work_plan)

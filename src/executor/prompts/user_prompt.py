@@ -1,7 +1,5 @@
 """User prompt builder for LLM execution."""
 
-from typing import Optional
-
 from ..models.execution_context import ExecutionContext, ProjectStatus
 from .template_compliance import build_template_compliance_section
 
@@ -87,6 +85,26 @@ If any required information is missing, clearly mark it as `[DATA MISSING: descr
 """
 
 
+def _build_refinement_context(context: ExecutionContext) -> str:
+    """Build a lightweight context summary for refinement prompts.
+
+    The previous plan already contains the LLM's understanding of the full context,
+    so we only need Jira metadata to anchor the refinement — not the full Confluence
+    docs and GitHub context again.
+    """
+    lines = [
+        f"**Key:** {context.issue_key}",
+    ]
+    if context.jira:
+        lines.append(f"**Title:** {context.jira.summary}")
+        lines.append(f"**Type:** {context.jira.issue_type}")
+        lines.append(f"**Status:** {context.jira.status}")
+        lines.append(f"**Project:** {context.jira.project_name} ({context.jira.project_key})")
+        if context.jira.components:
+            lines.append(f"**Components:** {', '.join(context.jira.components)}")
+    return "\n".join(lines)
+
+
 def build_refinement_prompt(
     context: ExecutionContext,
     feedback: str,
@@ -95,6 +113,9 @@ def build_refinement_prompt(
 ) -> str:
     """
     Build a refinement prompt that incorporates human feedback on a previous plan.
+
+    Uses a lightweight context summary (Jira metadata only) instead of the full
+    context, since the previous plan already encapsulates the LLM's analysis.
 
     Args:
         context: Original ExecutionContext (loaded from context store)
@@ -105,13 +126,13 @@ def build_refinement_prompt(
     Returns:
         Formatted refinement prompt string
     """
-    prompt_context = context.build_prompt_context()
+    refinement_context = _build_refinement_context(context)
 
     return f"""You are refining an existing work plan (version {version}) based on human feedback.
 
-## Original Task Context
+## Task Reference
 
-{prompt_context}
+{refinement_context}
 
 ---
 
@@ -131,10 +152,9 @@ def build_refinement_prompt(
 
 Incorporate the human feedback into the work plan. Specifically:
 
-1. **Re-read** the original task context above
-2. **Review** the previous work plan
-3. **Apply** the requested changes from human feedback
-4. **Regenerate** a complete, updated work plan
+1. **Review** the previous work plan carefully
+2. **Apply** the requested changes from human feedback
+3. **Regenerate** a complete, updated work plan
 
 **Important:**
 - Keep all sections from the original format (Understanding, Concerns, Analysis, Work Plan, Definition of Ready)

@@ -2,9 +2,10 @@
 
 from ..models.execution_context import ExecutionContext, ConfluenceTemplate
 from .template_compliance import build_template_compliance_section
+from .constants import LAYER_CODES_BLOCK
 
 
-PHASE_ZERO_FEEDBACK_SYSTEM_PROMPT = """You are an AI Requirements Analyst Agent performing a feedback incorporation pass (Phase 0.5).
+PHASE_ZERO_FEEDBACK_SYSTEM_PROMPT = f"""You are an AI Requirements Analyst Agent performing a feedback incorporation pass (Phase 0.5).
 
 You previously analyzed a Jira backlog issue and raised clarification questions. The task assignee has now provided answers in comments. Your job is to incorporate the feedback and refine the analysis.
 
@@ -73,13 +74,7 @@ Your response MUST be valid XML following the SAME structure as Phase 0:
 7. **Cite Sources:** Reference which comment answered which question
 8. **Strict Traceability:** Updated work areas and DoR criteria must still trace back to Use Case
 
-Layer codes:
-- `BE` - Backend, API, Microservices, Workers
-- `FE` - Frontend, UI/UX implementation
-- `INFRA` - Terraform, K8s, CI/CD pipelines
-- `DB` - Migrations, SQL, Schema changes
-- `QA` - Tests (E2E, Integration), Automation
-- `DOCS` - Documentation, Technical writing
+{LAYER_CODES_BLOCK}
 """
 
 

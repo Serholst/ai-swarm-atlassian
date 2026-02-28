@@ -676,17 +676,29 @@ def get_refined_context(
         candidates = []
 
     if candidates:
-        # Step 3.2: LLM Filtering (DeepSeek)
+        # Step 3.2: Document Filtering
+        # Use heuristic when excerpts are title-only (no body content from server)
         try:
-            selection_log = _llm_filter_documents_deepseek(
-                llm_client=llm_client,
-                jira_summary=jira_text.split("\n")[0],
-                jira_description=jira_text,
-                candidates=candidates,
+            has_real_excerpts = any(
+                c.get("excerpt", "").replace(f"Document titled: {c.get('title', '')}", "").strip()
+                for c in candidates
             )
+            if has_real_excerpts and llm_client:
+                selection_log = _llm_filter_documents_deepseek(
+                    llm_client=llm_client,
+                    jira_summary=jira_text.split("\n")[0],
+                    jira_description=jira_text,
+                    candidates=candidates,
+                )
+            else:
+                selection_log = _heuristic_filter_documents(
+                    jira_summary=jira_text.split("\n")[0],
+                    jira_description=jira_text,
+                    candidates=candidates,
+                )
             context.selection_log = selection_log
             selected_ids = selection_log.selected_ids
-            logger.info(f"Phase 3.2: DeepSeek selected {len(selected_ids)} IDs")
+            logger.info(f"Phase 3.2: Selected {len(selected_ids)} IDs ({selection_log.model})")
 
             # Step 3.3: Fetch selected documents
             for page_id in selected_ids:
@@ -1110,6 +1122,88 @@ def _llm_filter_documents_deepseek(
         logger.error(f"DeepSeek call failed: {e}")
         selection_log.raw_response = f"[ERROR: API call failed - {e}]"
         return selection_log
+
+
+# Stopwords for heuristic keyword filtering
+_STOPWORDS = frozenset({
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "shall",
+    "should", "may", "might", "can", "could", "must", "to", "of", "in",
+    "for", "on", "with", "at", "by", "from", "as", "into", "through",
+    "and", "or", "but", "not", "no", "if", "then", "so", "that", "this",
+    "it", "its", "we", "our", "i", "me", "my", "they", "them", "their",
+    "add", "create", "update", "implement", "new", "need", "use",
+})
+
+# Max documents to select via heuristic
+_HEURISTIC_MAX_DOCS = 5
+
+
+def _heuristic_filter_documents(
+    jira_summary: str,
+    jira_description: str,
+    candidates: list[dict],
+) -> SelectionLog:
+    """
+    Filter document candidates using keyword overlap instead of an LLM call.
+
+    Used when search results only have title-based excerpts (no body content),
+    making an LLM filtering call wasteful.
+
+    Args:
+        jira_summary: Task summary
+        jira_description: Full task description
+        candidates: List of {id, title, excerpt}
+
+    Returns:
+        SelectionLog with selected IDs based on keyword matching
+    """
+    # Extract keywords from task text
+    task_text = f"{jira_summary} {jira_description}".lower()
+    keywords = {
+        word for word in re.split(r"\W+", task_text)
+        if word and len(word) > 2 and word not in _STOPWORDS
+    }
+
+    logger.info("=" * 60)
+    logger.info("Heuristic Document Filtering (title-based)")
+    logger.info("=" * 60)
+    logger.info(f"Task keywords ({len(keywords)}): {sorted(keywords)[:15]}...")
+
+    # Score each candidate by keyword overlap with its title
+    scored = []
+    for c in candidates:
+        title_words = {w.lower() for w in re.split(r"\W+", c["title"]) if w}
+        overlap = keywords & title_words
+        scored.append((len(overlap), c))
+
+    # Sort by overlap descending, take top N with at least 1 match
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    if any(score > 0 for score, _ in scored):
+        selected = [c for score, c in scored if score > 0][:_HEURISTIC_MAX_DOCS]
+    else:
+        # No keyword matches — select all as safe fallback
+        selected = [c for _, c in scored][:_HEURISTIC_MAX_DOCS]
+
+    selected_ids = [c["id"] for c in selected]
+
+    # Log results
+    for c in candidates:
+        status = "SELECTED" if c["id"] in selected_ids else "rejected"
+        logger.info(f"  [{status}] {c['title']}")
+    logger.info(f"Heuristic selected {len(selected_ids)} of {len(candidates)} candidates")
+    logger.info("=" * 60)
+
+    return SelectionLog(
+        system_prompt="[heuristic: keyword overlap filter — no LLM call]",
+        user_prompt=f"Keywords: {sorted(keywords)[:20]}",
+        candidates=candidates,
+        raw_response=f"Heuristic selection: {selected_ids}",
+        selected_ids=selected_ids,
+        model="heuristic",
+        tokens_used=0,
+    )
 
 
 # =============================================================================
@@ -1649,6 +1743,35 @@ def extract_assignee_feedback(
         f"(filtered from {len(all_comments)} total)"
     )
     return assignee_comments
+
+
+def find_phase0_questions_timestamp(
+    mcp: MCPClientManager,
+    issue_key: str,
+) -> str | None:
+    """
+    Find the timestamp of the Phase 0 clarification questions comment.
+
+    Scans comments for the marker "Phase 0: Clarification Questions"
+    and returns its ``created`` timestamp for use as a Phase 0.5 anchor.
+
+    Args:
+        mcp: MCP client manager
+        issue_key: Jira issue key
+
+    Returns:
+        ISO timestamp string, or None if not found
+    """
+    try:
+        comments_response = mcp.jira_get_comments(issue_key)
+        all_comments = _parse_jira_comments(comments_response)
+        for comment in reversed(all_comments):  # Most recent first
+            body = comment.get("body", "")
+            if "Phase 0: Clarification Questions" in body:
+                return comment.get("created", None)
+    except Exception as e:
+        logger.warning(f"Could not search for questions comment: {e}")
+    return None
 
 
 # =============================================================================

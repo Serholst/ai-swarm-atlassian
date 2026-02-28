@@ -23,42 +23,38 @@ from openai import OpenAI
 from ..models.execution_context import ExecutionContext
 from ..models.llm_metrics import LLMCallMetrics, ExecutionMetrics
 from ..prompts import SYSTEM_PROMPT, build_user_prompt, build_refinement_prompt
+from ..prompts.constants import LAYER_CODES_BLOCK
 from .validation import (
     validate_work_plan,
     validate_response_sections,
     is_response_valid,
     get_validation_errors,
     get_validation_warnings,
+    regex_fix_work_plan,
     ValidationResult,
 )
 
 logger = logging.getLogger(__name__)
 
 # Retry prompt template for targeted Work Plan fixes
-RETRY_PROMPT_TEMPLATE = """Your previous Work Plan section had validation errors.
+RETRY_PROMPT_TEMPLATE = f"""Your previous Work Plan section had validation errors.
 
 ## Errors Found:
-{errors}
+{{errors}}
 
 ## Original Work Plan Section:
-{original_work_plan}
+{{original_work_plan}}
 
 ## Instructions:
 Please regenerate ONLY the Work Plan section (### 4. Work Plan) with the following corrections:
 
 1. Each step MUST follow format: - [ ] **Step N:** [description]
-2. Each step MUST include **Layer:** [BE/FE/INFRA/DB/QA/DOCS/GEN]
-3. Each step MUST include **Files:** [expected files]
-4. Each step MUST include **Acceptance:** [verification criteria]
+2. Each step MUST include **Specification:** [Goal: what this achieves | Outcome: the deliverable]
+3. Each step MUST include **Layer:** [BE/FE/INFRA/DB/QA/DOCS/GEN]
+4. Each step MUST include **Files:** [expected files]
+5. Each step MUST include **Acceptance:** [verification criteria]
 
-Layer codes:
-- BE - Backend, API, Microservices
-- FE - Frontend, UI/UX
-- INFRA - Terraform, K8s, CI/CD
-- DB - Migrations, Schema changes
-- QA - Tests, Automation
-- DOCS - Documentation
-- GEN - General/Cross-cutting
+{LAYER_CODES_BLOCK}
 
 Return ONLY the corrected Work Plan section, starting with "### 4. Work Plan".
 """
@@ -262,6 +258,34 @@ class LLMExecutor:
                 if validation_result.warnings:
                     logger.warning(f"Warnings: {validation_result.warnings}")
 
+                # Try regex post-processing before burning an LLM retry
+                fixed_plan, remaining_errors = regex_fix_work_plan(
+                    response.work_plan, validation_result.errors
+                )
+                if fixed_plan != response.work_plan:
+                    logger.info(
+                        f"Regex fix applied: {len(validation_result.errors)} errors → "
+                        f"{len(remaining_errors)} remaining"
+                    )
+                    response.work_plan = fixed_plan
+
+                    if not remaining_errors:
+                        # Re-validate to confirm regex fix was sufficient
+                        re_section_results = validate_response_sections(
+                            understanding=response.understanding,
+                            concerns=response.concerns,
+                            analysis=response.analysis,
+                            work_plan=response.work_plan,
+                            definition_of_ready=response.definition_of_ready,
+                        )
+                        if is_response_valid(re_section_results):
+                            logger.info("Regex fix resolved all errors — skipping LLM retry")
+                            validation_result.is_valid = True
+                            validation_result.errors = []
+                            break
+                        # Update remaining errors from re-validation
+                        validation_result.errors = get_validation_errors(re_section_results)
+
                 if attempt == max_attempts:
                     self.metrics.max_retries_hit = True
                     logger.error(
@@ -404,6 +428,33 @@ class LLMExecutor:
                 break
             else:
                 logger.warning(f"Attempt {attempt}: Validation FAILED - {validation_result.errors}")
+
+                # Try regex post-processing before burning an LLM retry
+                fixed_plan, remaining_errors = regex_fix_work_plan(
+                    response.work_plan, validation_result.errors
+                )
+                if fixed_plan != response.work_plan:
+                    logger.info(
+                        f"Regex fix applied: {len(validation_result.errors)} errors → "
+                        f"{len(remaining_errors)} remaining"
+                    )
+                    response.work_plan = fixed_plan
+
+                    if not remaining_errors:
+                        re_section_results = validate_response_sections(
+                            understanding=response.understanding,
+                            concerns=response.concerns,
+                            analysis=response.analysis,
+                            work_plan=response.work_plan,
+                            definition_of_ready=response.definition_of_ready,
+                        )
+                        if is_response_valid(re_section_results):
+                            logger.info("Regex fix resolved all errors — skipping LLM retry")
+                            validation_result.is_valid = True
+                            validation_result.errors = []
+                            break
+                        validation_result.errors = get_validation_errors(re_section_results)
+
                 if attempt == max_attempts:
                     self.metrics.max_retries_hit = True
                     logger.error(f"Max retries reached for refinement v{version}")

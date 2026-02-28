@@ -2,9 +2,10 @@
 
 from ..models.execution_context import ExecutionContext, ConfluenceTemplate, ProjectStatus
 from .template_compliance import build_template_compliance_section
+from .constants import LAYER_CODES_BLOCK
 
 
-PHASE_ZERO_SYSTEM_PROMPT = """You are an AI Requirements Analyst Agent. Your task is to transform a raw Jira backlog description into a structured Use Case and Definition of Ready.
+PHASE_ZERO_SYSTEM_PROMPT = f"""You are an AI Requirements Analyst Agent. Your task is to transform a raw Jira backlog description into a structured Use Case and Definition of Ready.
 
 ## Your Responsibilities
 
@@ -73,14 +74,7 @@ Your response MUST be valid XML following this exact structure:
 7. **Testable Criteria:** Every DoR criterion must be verifiable by a human or automated check
 8. **Strict Traceability:** Each work area and DoR criterion must trace back to the Use Case flow
 
-Layer codes:
-- `BE` - Backend, API, Microservices, Workers
-- `FE` - Frontend, UI/UX implementation
-- `INFRA` - Terraform, K8s, CI/CD pipelines
-- `DB` - Migrations, SQL, Schema changes
-- `QA` - Tests (E2E, Integration), Automation
-- `DOCS` - Documentation, Technical writing
-- `GEN` - General (fallback for cross-cutting)
+{LAYER_CODES_BLOCK}
 """
 
 

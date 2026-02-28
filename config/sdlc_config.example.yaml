@@ -54,6 +54,10 @@ jira:
   # Check your Jira: Project Settings → Issue Features → Configure Issue Links
   parent_link_type: "Parent"
 
+  # Link type for blocking relationships (review tasks, story dependencies)
+  # Common values: "Blocks", "is blocked by" — must match your Jira instance
+  blocking_link_type: "Blocks"
+
   # Blocking Task Naming Patterns
   blocking_tasks:
     architecture_review: "[REVIEW] Approve Architecture (HUMAN)"
@@ -183,3 +187,8 @@ agent:
   min_confidence: 0.7
   require_citations: true
   save_prompt: true
+
+  # Content budget (max chars per document injected into LLM prompt)
+  content_budget:
+    core_doc_max_chars: 12000       # Project Passport, Logical Architecture
+    supporting_doc_max_chars: 6000  # LLM-selected supporting documents

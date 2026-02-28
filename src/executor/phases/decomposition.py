@@ -30,6 +30,22 @@ logger = logging.getLogger(__name__)
 VALID_LAYERS = {"BE", "FE", "INFRA", "DB", "QA", "DOCS", "GEN"}
 
 
+def _truncate_on_boundary(text: str, max_chars: int = 1500) -> str:
+    """Truncate text at sentence or word boundary, appending '...' if cut."""
+    if len(text) <= max_chars:
+        return text
+    truncated = text[:max_chars]
+    # Try to cut at sentence boundary
+    last_sentence = max(truncated.rfind(". "), truncated.rfind(".\n"), truncated.rfind("\n\n"))
+    if last_sentence > max_chars // 2:
+        return truncated[: last_sentence + 1] + "\n\n..."
+    # Fall back to word boundary
+    last_space = truncated.rfind(" ")
+    if last_space > max_chars // 2:
+        return truncated[:last_space] + "..."
+    return truncated + "..."
+
+
 def extract_stories(work_plan: str) -> list[DecomposedStory]:
     """
     Extract stories from LLM work plan.
@@ -95,14 +111,31 @@ def extract_stories(work_plan: str) -> list[DecomposedStory]:
                 dep_nums = re.findall(r"Step\s+(\d+)", deps_text, re.IGNORECASE)
                 depends_on = [int(n) for n in dep_nums]
 
+        # Extract specification (Goal + Outcome, distinct from title)
+        spec_match = re.search(
+            r"\*\*Specification:\*\*\s*(.+?)(?=-\s*\*\*|\n\n|\Z)",
+            step_content,
+            re.DOTALL | re.IGNORECASE,
+        )
+        specification = spec_match.group(1).strip() if spec_match else ""
+
         # Extract title (first line after Step N:)
         title_match = re.match(r"([^\n]+)", step_content)
         title = title_match.group(1).strip() if title_match else f"Step {step_num}"
         # Clean up title - remove metadata if present on same line
         title = re.sub(r"\s*-\s*\*\*Layer.*$", "", title, flags=re.IGNORECASE).strip()
 
-        # Description is the cleaned content
-        description = re.sub(r"-\s*\*\*(?:Layer|Files|Acceptance|Depends on):\*\*.*?(?=(?:-\s*\*\*|\Z))", "", step_content, flags=re.DOTALL | re.IGNORECASE).strip()
+        # Description: prefer parsed Specification field, fall back to cleaned content
+        if specification:
+            description = specification
+        else:
+            description = re.sub(
+                r"-\s*\*\*(?:Layer|Files|Acceptance|Depends on|Specification):\*\*"
+                r".*?(?=(?:-\s*\*\*|\Z))",
+                "",
+                step_content,
+                flags=re.DOTALL | re.IGNORECASE,
+            ).strip()
 
         story = DecomposedStory(
             layer=layer,
@@ -283,6 +316,7 @@ def create_blocking_review_task(
     mcp: MCPClientManager,
     project_key: str,
     issue_key: str,
+    config: Optional[dict] = None,
 ) -> Optional[str]:
     """
     Create blocking review Story.
@@ -294,6 +328,7 @@ def create_blocking_review_task(
         mcp: MCP client manager
         project_key: Jira project key
         issue_key: Original issue key (to block)
+        config: SDLC config dict (optional, for blocking_link_type)
 
     Returns:
         Created issue key, or None on failure
@@ -335,15 +370,23 @@ This blocking Story must be marked as **Done** before the feature can progress.
         logger.info(f"Created review Story: {review_key}")
 
         # Link review Story to block the original issue
+        blocking_link_type = "Blocks"
+        if config:
+            blocking_link_type = config.get("jira", {}).get(
+                "blocking_link_type", "Blocks"
+            )
         try:
             mcp.jira_link_issues(
                 from_key=review_key,
                 to_key=issue_key,
-                link_type="Blocks",
+                link_type=blocking_link_type,
             )
             logger.info(f"Created blocking link: {review_key} blocks {issue_key}")
         except Exception as e:
-            logger.warning(f"Failed to create blocking link: {e}")
+            logger.error(
+                f"Failed to create blocking link ({blocking_link_type}): "
+                f"{review_key} -> {issue_key}: {e}"
+            )
 
         return review_key
 
@@ -423,7 +466,7 @@ def build_consolidated_adf_comment(
     if plan_summary:
         ctx_lines.append("### Work Plan Summary")
         ctx_lines.append("")
-        ctx_lines.append(plan_summary[:1500])
+        ctx_lines.append(_truncate_on_boundary(plan_summary, 1500))
         ctx_lines.append("")
 
     if issues:
@@ -452,12 +495,7 @@ def build_consolidated_adf_comment(
         headers = ["#", "Layer", "Story Title", "Confidence", "Specification"]
         rows = []
         for story in result.stories:
-            spec = (
-                story.description[:80] + "..."
-                if len(story.description) > 80
-                else story.description
-            )
-            spec = spec.replace("\n", " ")
+            spec = _truncate_on_boundary(story.description, 120).replace("\n", " ")
             conf_label = "HIGH" if story.confidence >= 0.7 else "LOW"
             conf_str = f"{story.confidence:.0%} ({conf_label})"
             rows.append(
@@ -519,12 +557,12 @@ def build_consolidated_adf_comment(
     })
 
     # --- Expand 3: Executor Rationale ---
-    ctx_text = result.cot_context or "Task context not available"
-    if len(ctx_text) > 500:
-        ctx_text = ctx_text[:500] + "..."
-    decision_text = result.cot_decision or "Technical approach not specified"
-    if len(decision_text) > 1000:
-        decision_text = decision_text[:1000] + "..."
+    ctx_text = _truncate_on_boundary(
+        result.cot_context or "Task context not available", 500
+    )
+    decision_text = _truncate_on_boundary(
+        result.cot_decision or "Technical approach not specified", 1000
+    )
 
     cot_lines = [
         f"**Context:** {ctx_text}",
@@ -614,6 +652,7 @@ def handle_analysis_decomposition(
         mcp=mcp,
         project_key=project_key,
         issue_key=issue_key,
+        config=config,
     )
     result.review_task_key = review_task_key
 

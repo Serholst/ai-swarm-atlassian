@@ -311,6 +311,7 @@ def create_jira_stories(
 def create_dependency_links(
     mcp: MCPClientManager,
     created_stories: list[tuple[DecomposedStory, str]],
+    config: dict | None = None,
 ) -> int:
     """
     Create blocking links between dependent stories.
@@ -321,12 +322,16 @@ def create_dependency_links(
     Args:
         mcp: MCP client manager
         created_stories: List of (story, jira_key) tuples from create_jira_stories
+        config: SDLC config dict (optional, for blocking_link_type)
 
     Returns:
         Number of links created
     """
     # Build order -> key mapping
     order_to_key = {story.order: key for story, key in created_stories}
+    blocking_link_type = "Blocks"
+    if config:
+        blocking_link_type = config.get("jira", {}).get("blocking_link_type", "Blocks")
 
     links_created = 0
     for story, story_key in created_stories:
@@ -343,7 +348,7 @@ def create_dependency_links(
                 mcp.jira_link_issues(
                     from_key=dep_key,
                     to_key=story_key,
-                    link_type="Blocks",
+                    link_type=blocking_link_type,
                 )
                 logger.info(f"Created dependency link: {dep_key} blocks {story_key}")
                 links_created += 1

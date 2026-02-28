@@ -32,6 +32,7 @@ from .context_builder import (
     # Phase 0.5 (Feedback extraction)
     has_existing_phase0_analysis,
     extract_assignee_feedback,
+    find_phase0_questions_timestamp,
     # Stage 4
     build_execution_context,
     # Full Pipelines
@@ -150,4 +151,5 @@ __all__ = [
     # Context helpers
     "has_existing_phase0_analysis",
     "extract_assignee_feedback",
+    "find_phase0_questions_timestamp",
 ]

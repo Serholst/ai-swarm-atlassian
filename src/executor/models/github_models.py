@@ -12,15 +12,18 @@ from typing import Optional
 
 class RepoStatus(Enum):
     """Repository discovery status."""
-    EXISTS = "exists"           # Repository found and accessible
-    NOT_FOUND = "not_found"     # URL provided but repo doesn't exist or inaccessible
-    NEW_PROJECT = "new_project" # No URL found - repository to be created
+
+    EXISTS = "exists"  # Repository found and accessible
+    NOT_FOUND = "not_found"  # URL provided but repo doesn't exist or inaccessible
+    NEW_PROJECT = "new_project"  # No URL found - repository to be created
+    SKIPPED = "skipped"  # GitHub fetch skipped by gate (non-code task or no URL)
 
 
 @dataclass
 class RepoStructure:
     """Repository directory structure (filtered to key directories)."""
-    tree: str                           # Markdown tree representation
+
+    tree: str  # Markdown tree representation
     key_directories: list[str] = field(default_factory=list)  # src/, lib/, tests/, etc.
     file_count: int = 0
     primary_language: Optional[str] = None
@@ -29,18 +32,30 @@ class RepoStructure:
 @dataclass
 class ConfigSummary:
     """Summary of a configuration file."""
-    path: str                           # File path in repo (e.g., "package.json")
-    summary: str                        # Key information extracted
-    in_confluence: bool = False         # True if details already in Confluence docs
+
+    path: str  # File path in repo (e.g., "package.json")
+    summary: str  # Key information extracted
+    in_confluence: bool = False  # True if details already in Confluence docs
 
 
 @dataclass
 class CodeSnippet:
     """Relevant code reference from the repository."""
-    path: str                           # File path
-    lines: str                          # Line range (e.g., "42-67")
-    content: str                        # Actual code snippet
-    relevance: str                      # Why it's relevant to the task
+
+    path: str  # File path
+    lines: str  # Line range (e.g., "42-67")
+    content: str  # Actual code snippet
+    relevance: str  # Why it's relevant to the task
+
+
+@dataclass
+class GitHubFetchDecision:
+    """Result of the should_fetch_github_context() gate evaluation."""
+
+    should_fetch: bool
+    reason: str
+    repo_url: str | None = None
+    source: str = "none"  # jira_description|assignee_comment|custom_field|confluence_passport
 
 
 @dataclass
@@ -55,7 +70,14 @@ class GitHubContext:
     # Discovery
     repository_url: Optional[str] = None
     status: RepoStatus = RepoStatus.NEW_PROJECT
-    discovery_source: str = "none"      # "jira_description" or "confluence_passport"
+    discovery_source: str = "none"  # "jira_description" or "confluence_passport"
+
+    # Task-level repo override tracking
+    task_repo_url: str | None = None  # URL from Jira (description/comments/fields)
+    project_repo_url: str | None = None  # URL from Confluence Passport
+
+    # Skip tracking (populated when status == SKIPPED)
+    skip_reason: str = ""
 
     # Repository metadata
     owner: str = ""
@@ -74,7 +96,7 @@ class GitHubContext:
 
     # Recent activity (never in Confluence)
     recent_commits: list[str] = field(default_factory=list)  # Last 5-10 commit messages
-    open_prs: list[str] = field(default_factory=list)        # Titles of open PRs
+    open_prs: list[str] = field(default_factory=list)  # Titles of open PRs
 
     # Deduplication tracking
     skipped_topics: list[str] = field(default_factory=list)  # Topics covered in Confluence
@@ -93,6 +115,9 @@ class GitHubContext:
 
         if self.status == RepoStatus.NOT_FOUND:
             return f"**GitHub:** Repository not found or inaccessible ({self.repository_url})"
+
+        if self.status == RepoStatus.SKIPPED:
+            return f"**GitHub:** Skipped — {self.skip_reason or 'not required for this task'}"
 
         sections = []
 
@@ -155,7 +180,9 @@ class GitHubContext:
         if self.skipped_topics:
             sections.append("### Skipped (Already in Confluence)")
             sections.append("")
-            sections.append(f"The following topics are documented in Confluence: {', '.join(self.skipped_topics)}")
+            sections.append(
+                f"The following topics are documented in Confluence: {', '.join(self.skipped_topics)}"
+            )
             sections.append("")
 
         # Errors
@@ -178,12 +205,19 @@ class GitHubContext:
                 "owner": self.owner,
                 "repo_name": self.repo_name,
                 "primary_language": self.primary_language,
+                "task_repo_url": self.task_repo_url,
+                "project_repo_url": self.project_repo_url,
+                "skip_reason": self.skip_reason,
             },
-            "structure": {
-                "tree": self.structure.tree if self.structure else "",
-                "key_directories": self.structure.key_directories if self.structure else [],
-                "file_count": self.structure.file_count if self.structure else 0,
-            } if self.structure else None,
+            "structure": (
+                {
+                    "tree": self.structure.tree if self.structure else "",
+                    "key_directories": self.structure.key_directories if self.structure else [],
+                    "file_count": self.structure.file_count if self.structure else 0,
+                }
+                if self.structure
+                else None
+            ),
             "configs": [
                 {"path": c.path, "summary": c.summary, "in_confluence": c.in_confluence}
                 for c in self.configs

@@ -438,7 +438,8 @@ def build_consolidated_adf_comment(
     content.append(MarkdownToADF._heading("AI Executor -- Analysis & Decomposition", 2))
 
     # --- Expand 1: Context Summary ---
-    ctx_lines = [f"**Task:** {execution_context.jira.summary}", ""]
+    jira_summary = execution_context.jira.summary if execution_context.jira else parent_key
+    ctx_lines = [f"**Task:** {jira_summary}", ""]
     if execution_context.refined_confluence:
         rc = execution_context.refined_confluence
         ctx_lines.append(f"**Project Space:** {rc.project_space}")
@@ -643,6 +644,9 @@ def handle_analysis_decomposition(
         DecompositionResult with created artifact references
     """
     logger.info(f"Analysis & Decomposition for {issue_key}")
+
+    if not execution_context.jira:
+        raise ValueError(f"JiraContext is required for decomposition of {issue_key}")
 
     # Parse LLM response (with confidence scoring)
     result = parse_llm_response(

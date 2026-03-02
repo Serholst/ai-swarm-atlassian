@@ -30,6 +30,7 @@ from ..models.execution_context import (
 MIN_PAGE_CONTENT_LENGTH = 50
 from ..models.github_models import (
     GitHubContext,
+    GitHubFetchDecision,
     RepoStatus,
     RepoStructure,
     ConfigSummary,
@@ -95,6 +96,7 @@ Select relevant page IDs. Return JSON only."""
 # Stage 1: Trigger - Validate and parse issue key
 # =============================================================================
 
+
 def parse_issue_key(task_input: str) -> str:
     """
     Parse Jira issue key from various input formats.
@@ -124,6 +126,7 @@ def parse_issue_key(task_input: str) -> str:
 # Stage 1.5: Issue Status Check (lightweight, before full enrichment)
 # =============================================================================
 
+
 def get_issue_status(mcp: MCPClientManager, issue_key: str) -> str:
     """
     Lightweight status check — fetches only the Jira issue status.
@@ -148,6 +151,7 @@ def get_issue_status(mcp: MCPClientManager, issue_key: str) -> str:
 # =============================================================================
 # Stage 2: Jira Enrichment - Extract context from Jira
 # =============================================================================
+
 
 def extract_jira_context(mcp: MCPClientManager, issue_key: str) -> JiraContext:
     """
@@ -217,7 +221,9 @@ def _parse_jira_response(issue_key: str, response: str) -> JiraContext:
         return []
 
     # Extract summary from title line: # KEY: Summary
-    summary_match = re.search(r"^#\s*" + re.escape(issue_key) + r":\s*(.+)$", response, re.MULTILINE)
+    summary_match = re.search(
+        r"^#\s*" + re.escape(issue_key) + r":\s*(.+)$", response, re.MULTILINE
+    )
     summary = summary_match.group(1).strip() if summary_match else ""
 
     # Extract basic fields
@@ -320,9 +326,7 @@ def _parse_jira_comments(response: str) -> list[dict]:
         # Try new format with account_id: "Author (accountId) - timestamp"
         # Use greedy (.+) for author to match the LAST parenthesized group
         # before the " - timestamp", handling names like "John (Contractor)"
-        header_match = re.match(
-            r"(.+)\s*\(([^)]*)\)\s*-\s*(\d{4}-\d{2}-\d{2}.*?)$", header
-        )
+        header_match = re.match(r"(.+)\s*\(([^)]*)\)\s*-\s*(\d{4}-\d{2}-\d{2}.*?)$", header)
 
         if header_match:
             author = header_match.group(1).strip()
@@ -330,12 +334,14 @@ def _parse_jira_comments(response: str) -> list[dict]:
             created = header_match.group(3).strip()
             body = "\n".join(lines[1:]).strip()
 
-            comments.append({
-                "author": author,
-                "account_id": account_id,
-                "created": created,
-                "body": body,
-            })
+            comments.append(
+                {
+                    "author": author,
+                    "account_id": account_id,
+                    "created": created,
+                    "body": body,
+                }
+            )
         else:
             # Fallback: legacy format without account_id "Author - timestamp"
             legacy_match = re.match(r"(.+?)\s*-\s*(\d{4}-\d{2}-\d{2}.*?)$", header)
@@ -344,12 +350,14 @@ def _parse_jira_comments(response: str) -> list[dict]:
                 created = legacy_match.group(2).strip()
                 body = "\n".join(lines[1:]).strip()
 
-                comments.append({
-                    "author": author,
-                    "account_id": "",
-                    "created": created,
-                    "body": body,
-                })
+                comments.append(
+                    {
+                        "author": author,
+                        "account_id": "",
+                        "created": created,
+                        "body": body,
+                    }
+                )
 
     return comments
 
@@ -380,6 +388,7 @@ def _derive_confluence_space(jira: JiraContext) -> str:
 # =============================================================================
 # Stage 3: Confluence Knowledge Retrieval
 # =============================================================================
+
 
 def extract_confluence_context(
     mcp: MCPClientManager,
@@ -440,8 +449,7 @@ def extract_confluence_context(
     if project_name:
         try:
             passport_response = mcp.confluence_search_pages(
-                f'space = "{space_key}" AND title ~ "Project Passport"',
-                limit=1
+                f'space = "{space_key}" AND title ~ "Project Passport"', limit=1
             )
             if "Found 0 pages" not in passport_response:
                 _parse_confluence_search_response(passport_response, context, "passport")
@@ -489,7 +497,9 @@ def _parse_confluence_page_response(response: str, context: ConfluenceContext, t
         context.sdlc_rules_url = url
 
 
-def _parse_confluence_search_response(response: str, context: ConfluenceContext, target: str) -> None:
+def _parse_confluence_search_response(
+    response: str, context: ConfluenceContext, target: str
+) -> None:
     """Parse Confluence search response and update context."""
     # Search response format:
     # Found N pages:
@@ -522,6 +532,7 @@ def _parse_confluence_search_response(response: str, context: ConfluenceContext,
 # =============================================================================
 # Stage 3 (Enhanced): Two-Stage Retrieval with LLM Filtering
 # =============================================================================
+
 
 def get_refined_context(
     mcp: MCPClientManager,
@@ -611,17 +622,21 @@ def get_refined_context(
                         full_page = mcp.confluence_get_page(page_id=page["id"])
                         content = _extract_text_content(full_page)
 
-                        context.core_documents.append(RefinedDocument(
-                            title=page["title"],
-                            url=page["url"],
-                            content=content,
-                            id=page["id"],
-                        ))
+                        context.core_documents.append(
+                            RefinedDocument(
+                                title=page["title"],
+                                url=page["url"],
+                                content=content,
+                                id=page["id"],
+                            )
+                        )
 
                         # Detect empty pages (exist but have no meaningful content)
                         if len(content.strip()) < MIN_PAGE_CONTENT_LENGTH:
                             found_mandatory[doc_type] = "empty"
-                            logger.info(f"Phase 2: Found {doc_type} - '{page['title']}' (EMPTY - {len(content.strip())} chars)")
+                            logger.info(
+                                f"Phase 2: Found {doc_type} - '{page['title']}' (EMPTY - {len(content.strip())} chars)"
+                            )
                         else:
                             found_mandatory[doc_type] = "found"
                             logger.info(f"Phase 2: Found {doc_type} - '{page['title']}'")
@@ -647,7 +662,9 @@ def get_refined_context(
             if status is False:
                 context.missing_critical_data.append(f"{doc_type} (needs creation)")
             elif status == "empty":
-                context.missing_critical_data.append(f"{doc_type} (exists but empty - needs content)")
+                context.missing_critical_data.append(
+                    f"{doc_type} (exists but empty - needs content)"
+                )
         logger.info(f"Phase 2: INCOMPLETE project detected - {context.missing_critical_data}")
     else:
         logger.info("Phase 2: All mandatory docs found with content")
@@ -708,12 +725,14 @@ def get_refined_context(
 
                     candidate = next((c for c in candidates if c["id"] == page_id), {})
 
-                    context.supporting_documents.append(RefinedDocument(
-                        title=candidate.get("title", "Unknown"),
-                        url=candidate.get("url", ""),
-                        content=content,
-                        id=page_id,
-                    ))
+                    context.supporting_documents.append(
+                        RefinedDocument(
+                            title=candidate.get("title", "Unknown"),
+                            url=candidate.get("url", ""),
+                            content=content,
+                            id=page_id,
+                        )
+                    )
                 except Exception as e:
                     logger.warning(f"Phase 3.3: Failed to fetch {page_id}: {e}")
 
@@ -753,17 +772,17 @@ def _extract_folder_id_from_url(url: str) -> str | None:
         return None
 
     # Pattern 1: /folder/{id}
-    match = re.search(r'/folder/(\d+)', url)
+    match = re.search(r"/folder/(\d+)", url)
     if match:
         return match.group(1)
 
     # Pattern 2: /pages/{id}/ or /pages/{id}
-    match = re.search(r'/pages/(\d+)', url)
+    match = re.search(r"/pages/(\d+)", url)
     if match:
         return match.group(1)
 
     # Pattern 3: pageId query parameter
-    match = re.search(r'pageId=(\d+)', url)
+    match = re.search(r"pageId=(\d+)", url)
     if match:
         return match.group(1)
 
@@ -804,7 +823,7 @@ def _resolve_confluence_location(
         if folder_id:
             logger.info(f"Phase 1: Resolved from URL - folder_id={folder_id}")
             # Extract space from URL if possible, otherwise use provided space_key
-            space_match = re.search(r'/spaces/([^/]+)/', project_link)
+            space_match = re.search(r"/spaces/([^/]+)/", project_link)
             if space_match:
                 url_space = space_match.group(1).upper()
                 logger.info(f"Phase 1: Using space from URL: {url_space}")
@@ -815,7 +834,9 @@ def _resolve_confluence_location(
 
     # Strategy 2: Search-based resolution (legacy fallback)
     if project_folder:
-        logger.info(f"Phase 1: Falling back to search - space={space_key}, folder='{project_folder}'")
+        logger.info(
+            f"Phase 1: Falling back to search - space={space_key}, folder='{project_folder}'"
+        )
 
         try:
             # 2a: Exact title search
@@ -879,7 +900,7 @@ def _find_ancestor_by_name(ancestors_response: str, folder_name: str) -> str | N
         Page ID of matching ancestor, or None if not found
     """
     # Parse format: "1. [ID:123] Title"
-    pattern = r'\[ID:(\d+)\]\s*(.+?)(?:\n|$)'
+    pattern = r"\[ID:(\d+)\]\s*(.+?)(?:\n|$)"
 
     for match in re.finditer(pattern, ancestors_response):
         ancestor_id = match.group(1)
@@ -890,7 +911,7 @@ def _find_ancestor_by_name(ancestors_response: str, folder_name: str) -> str | N
             return ancestor_id
 
     # Also check "Direct parent" line
-    parent_match = re.search(r'Direct parent:\s*\[ID:(\d+)\]\s*(.+?)(?:\n|$)', ancestors_response)
+    parent_match = re.search(r"Direct parent:\s*\[ID:(\d+)\]\s*(.+?)(?:\n|$)", ancestors_response)
     if parent_match:
         parent_id = parent_match.group(1)
         parent_title = parent_match.group(2).strip()
@@ -904,12 +925,12 @@ def _find_ancestor_by_name(ancestors_response: str, folder_name: str) -> str | N
 def _extract_page_id(response: str) -> str:
     """Extract page ID from Confluence response."""
     # Try URL pattern first
-    url_match = re.search(r'/pages/(\d+)/', response)
+    url_match = re.search(r"/pages/(\d+)/", response)
     if url_match:
         return url_match.group(1)
 
     # Try pageId parameter
-    id_match = re.search(r'pageId=(\d+)', response)
+    id_match = re.search(r"pageId=(\d+)", response)
     if id_match:
         return id_match.group(1)
 
@@ -939,13 +960,13 @@ def _extract_search_keywords(text: str, max_keywords: int = 5) -> str:
     terms = []
 
     # CamelCase terms (e.g., getUserProfile)
-    terms += re.findall(r'\b[A-Z][a-z]+(?:[A-Z][a-z]+)+\b', text)
+    terms += re.findall(r"\b[A-Z][a-z]+(?:[A-Z][a-z]+)+\b", text)
 
     # Acronyms (e.g., API, OAuth)
-    terms += re.findall(r'\b[A-Z]{2,}\b', text)
+    terms += re.findall(r"\b[A-Z]{2,}\b", text)
 
     # Technical suffixes
-    terms += re.findall(r'\b\w+(?:API|Service|Module|Handler|Client|Provider)\b', text, re.I)
+    terms += re.findall(r"\b\w+(?:API|Service|Module|Handler|Client|Provider)\b", text, re.I)
 
     # Deduplicate and limit
     unique_terms = list(dict.fromkeys(terms))[:max_keywords]
@@ -965,22 +986,24 @@ def _parse_search_results(response: str) -> list[dict]:
     logger.debug(f"Parsing search response:\n{response[:500]}...")
 
     # New format with explicit ID: - [ID:123] **Title** (SPACE) - [View](URL)
-    pattern_with_id = r'\[ID:(\d+)\]\s*\*\*(.+?)\*\*\s*\([^)]+\)\s*-\s*\[View\]\(([^)]+)\)'
+    pattern_with_id = r"\[ID:(\d+)\]\s*\*\*(.+?)\*\*\s*\([^)]+\)\s*-\s*\[View\]\(([^)]+)\)"
 
     for match in re.finditer(pattern_with_id, response):
         page_id = match.group(1)
         title = match.group(2)
         url = match.group(3)
-        pages.append({
-            "id": page_id,
-            "title": title,
-            "url": url,
-        })
+        pages.append(
+            {
+                "id": page_id,
+                "title": title,
+                "url": url,
+            }
+        )
         logger.debug(f"Parsed page: id={page_id}, title={title}")
 
     # Fallback to old format: - **Title** (SPACE) - [View](URL)
     if not pages:
-        pattern_legacy = r'\*\*(.+?)\*\*\s*\([^)]+\)\s*-\s*\[View\]\(([^)]+)\)'
+        pattern_legacy = r"\*\*(.+?)\*\*\s*\([^)]+\)\s*-\s*\[View\]\(([^)]+)\)"
 
         for match in re.finditer(pattern_legacy, response):
             title = match.group(1)
@@ -989,17 +1012,17 @@ def _parse_search_results(response: str) -> list[dict]:
             page_id = ""
 
             # Pattern 1: /pages/{id}/ (most common)
-            id_match = re.search(r'/pages/(\d+)/', url)
+            id_match = re.search(r"/pages/(\d+)/", url)
             if id_match:
                 page_id = id_match.group(1)
             else:
                 # Pattern 2: pageId query parameter
-                id_match = re.search(r'pageId=(\d+)', url)
+                id_match = re.search(r"pageId=(\d+)", url)
                 if id_match:
                     page_id = id_match.group(1)
                 else:
                     # Pattern 3: /pages/{id} at end of URL (no trailing slash)
-                    id_match = re.search(r'/pages/(\d+)(?:\?|$)', url)
+                    id_match = re.search(r"/pages/(\d+)(?:\?|$)", url)
                     if id_match:
                         page_id = id_match.group(1)
                     else:
@@ -1010,11 +1033,13 @@ def _parse_search_results(response: str) -> list[dict]:
                             f"using fallback: {page_id}"
                         )
 
-            pages.append({
-                "id": page_id,
-                "title": title,
-                "url": url,
-            })
+            pages.append(
+                {
+                    "id": page_id,
+                    "title": title,
+                    "url": url,
+                }
+            )
 
     if not pages and "Found" in response and "pages" in response:
         logger.error(f"Search returned results but parsing failed. Response:\n{response}")
@@ -1085,6 +1110,9 @@ def _llm_filter_documents_deepseek(
             max_tokens=256,
         )
 
+        if not response.choices:
+            raise RuntimeError("LLM API returned empty choices array during document selection")
+
         raw_content = response.choices[0].message.content or ""
         tokens_used = response.usage.total_tokens if response.usage else 0
         logger.info(f"DeepSeek raw response: {raw_content}")
@@ -1125,15 +1153,74 @@ def _llm_filter_documents_deepseek(
 
 
 # Stopwords for heuristic keyword filtering
-_STOPWORDS = frozenset({
-    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
-    "have", "has", "had", "do", "does", "did", "will", "would", "shall",
-    "should", "may", "might", "can", "could", "must", "to", "of", "in",
-    "for", "on", "with", "at", "by", "from", "as", "into", "through",
-    "and", "or", "but", "not", "no", "if", "then", "so", "that", "this",
-    "it", "its", "we", "our", "i", "me", "my", "they", "them", "their",
-    "add", "create", "update", "implement", "new", "need", "use",
-})
+_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "have",
+        "has",
+        "had",
+        "do",
+        "does",
+        "did",
+        "will",
+        "would",
+        "shall",
+        "should",
+        "may",
+        "might",
+        "can",
+        "could",
+        "must",
+        "to",
+        "of",
+        "in",
+        "for",
+        "on",
+        "with",
+        "at",
+        "by",
+        "from",
+        "as",
+        "into",
+        "through",
+        "and",
+        "or",
+        "but",
+        "not",
+        "no",
+        "if",
+        "then",
+        "so",
+        "that",
+        "this",
+        "it",
+        "its",
+        "we",
+        "our",
+        "i",
+        "me",
+        "my",
+        "they",
+        "them",
+        "their",
+        "add",
+        "create",
+        "update",
+        "implement",
+        "new",
+        "need",
+        "use",
+    }
+)
 
 # Max documents to select via heuristic
 _HEURISTIC_MAX_DOCS = 5
@@ -1161,7 +1248,8 @@ def _heuristic_filter_documents(
     # Extract keywords from task text
     task_text = f"{jira_summary} {jira_description}".lower()
     keywords = {
-        word for word in re.split(r"\W+", task_text)
+        word
+        for word in re.split(r"\W+", task_text)
         if word and len(word) > 2 and word not in _STOPWORDS
     }
 
@@ -1210,6 +1298,7 @@ def _heuristic_filter_documents(
 # Stage 3b: GitHub Context Extraction
 # =============================================================================
 
+
 def extract_github_url(text: str) -> str | None:
     """
     Extract GitHub repository URL from text (Jira description or Confluence).
@@ -1223,14 +1312,14 @@ def extract_github_url(text: str) -> str | None:
     # Match GitHub repository URLs
     # Patterns: https://github.com/owner/repo, git@github.com:owner/repo.git
     patterns = [
-        r'https?://github\.com/([a-zA-Z0-9_-]+/[a-zA-Z0-9_.-]+?)(?:\.git)?(?:/|$|\s|\)|\])',
-        r'git@github\.com:([a-zA-Z0-9_-]+/[a-zA-Z0-9_.-]+?)(?:\.git)?(?:\s|$)',
+        r"https?://github\.com/([a-zA-Z0-9_-]+/[a-zA-Z0-9_.-]+?)(?:\.git)?(?:/|$|\s|\)|\])",
+        r"git@github\.com:([a-zA-Z0-9_-]+/[a-zA-Z0-9_.-]+?)(?:\.git)?(?:\s|$)",
     ]
 
     for pattern in patterns:
         match = re.search(pattern, text)
         if match:
-            repo_path = match.group(1).rstrip('/')
+            repo_path = match.group(1).rstrip("/")
             return f"https://github.com/{repo_path}"
 
     return None
@@ -1247,14 +1336,186 @@ def parse_github_url(url: str) -> tuple[str, str]:
         (owner, repo) tuple
     """
     # Remove .git suffix if present
-    url = url.rstrip('/').replace('.git', '')
+    url = url.rstrip("/").replace(".git", "")
 
     # Extract owner/repo from URL
-    match = re.search(r'github\.com[/:]([a-zA-Z0-9_-]+)/([a-zA-Z0-9_.-]+)', url)
+    match = re.search(r"github\.com[/:]([a-zA-Z0-9_-]+)/([a-zA-Z0-9_.-]+)", url)
     if match:
         return match.group(1), match.group(2)
 
     raise ValueError(f"Could not parse GitHub URL: {url}")
+
+
+def extract_github_url_from_comments(
+    comments: list[dict],
+    assignee_account_id: str | None = None,
+) -> str | None:
+    """
+    Scan Jira comments for a GitHub repository URL.
+
+    Optionally restricts to comments by the assignee only. Scans in reverse
+    chronological order so the most recent URL wins.
+
+    Args:
+        comments: Parsed comment dicts [{author, account_id, created, body}]
+        assignee_account_id: If provided, only scan this person's comments
+
+    Returns:
+        GitHub repository URL or None
+    """
+    for comment in reversed(comments):
+        if assignee_account_id and comment.get("account_id") != assignee_account_id:
+            continue
+        url = extract_github_url(comment.get("body", ""))
+        if url:
+            return url
+    return None
+
+
+# Labels that signal non-code work (gate will skip GitHub fetch for these)
+NON_CODE_LABELS: frozenset[str] = frozenset(
+    {
+        "documentation",
+        "docs-only",
+        "no-code",
+        "process",
+        "meeting",
+        "spike",
+        "research",
+    }
+)
+
+# Feature types that don't need GitHub context
+NON_CODE_FEATURE_TYPES: frozenset[str] = frozenset(
+    {
+        "documentation_only",
+        "process",
+    }
+)
+
+
+def _is_code_related_task(
+    jira_context: "JiraContext",
+    feature_type: str | None = None,
+) -> bool:
+    """
+    Determine if a task is code-related based on issue metadata.
+
+    Default is True (assume code-related) because most Jira issues in
+    an SDLC pipeline involve code changes. Only explicit non-code signals
+    trigger a False return.
+    """
+    lower_labels = {lbl.lower() for lbl in jira_context.labels}
+    if lower_labels & NON_CODE_LABELS:
+        return False
+
+    if feature_type and feature_type in NON_CODE_FEATURE_TYPES:
+        return False
+
+    return True
+
+
+def should_fetch_github_context(
+    jira_context: "JiraContext",
+    refined_confluence: "RefinedConfluenceContext | None" = None,
+    feature_type: str | None = None,
+) -> GitHubFetchDecision:
+    """
+    Evaluate whether Stage 3b (GitHub context extraction) should execute.
+
+    Decision logic (priority order):
+    1. If the task is not code-related (labels, feature_type) -> skip
+    2. Scan for a repo URL across all sources (priority order):
+       a. Jira description
+       b. Assignee comments
+       c. Custom field (project_link if it's a github.com URL)
+       d. Confluence Project Passport
+    3. If no URL found anywhere -> skip
+    4. Otherwise -> fetch, with source tracking
+
+    Args:
+        jira_context: Stage 2 output with all Jira data
+        refined_confluence: Stage 3a output (may be None)
+        feature_type: Optional Phase 0 feature_type hint
+
+    Returns:
+        GitHubFetchDecision with should_fetch, repo_url, reason, source
+    """
+    # Gate 1: Is this a code-related task?
+    if not _is_code_related_task(jira_context, feature_type):
+        non_code_signal = (
+            f"feature_type={feature_type}"
+            if feature_type and feature_type in NON_CODE_FEATURE_TYPES
+            else f"labels={jira_context.labels}"
+        )
+        return GitHubFetchDecision(
+            should_fetch=False,
+            reason=f"Non-code task ({non_code_signal})",
+        )
+
+    # Gate 2: Multi-source URL discovery (priority order)
+    task_repo_url: str | None = None
+    task_source: str = "none"
+
+    # Priority 1: Jira description
+    url = extract_github_url(jira_context.description)
+    if url:
+        task_repo_url = url
+        task_source = "jira_description"
+
+    # Priority 2: Assignee comments
+    if not task_repo_url:
+        url = extract_github_url_from_comments(
+            jira_context.comments,
+            assignee_account_id=jira_context.assignee_account_id,
+        )
+        if url:
+            task_repo_url = url
+            task_source = "assignee_comment"
+
+    # Priority 3: Custom field (project_link if it's a GitHub URL)
+    if not task_repo_url and jira_context.project_link:
+        url = extract_github_url(jira_context.project_link)
+        if url:
+            task_repo_url = url
+            task_source = "custom_field"
+
+    # Priority 4: Confluence Project Passport
+    project_repo_url: str | None = None
+    if refined_confluence:
+        for doc in refined_confluence.core_documents:
+            if "passport" in doc.title.lower():
+                url = extract_github_url(doc.content)
+                if url:
+                    project_repo_url = url
+                    break
+
+    # If no task-level URL found, fall back to project-level
+    if not task_repo_url and project_repo_url:
+        task_repo_url = project_repo_url
+        task_source = "confluence_passport"
+
+    # No URL found anywhere
+    if not task_repo_url:
+        return GitHubFetchDecision(
+            should_fetch=False,
+            reason="No GitHub repository URL found in any source",
+        )
+
+    # URL found -- log override if task URL differs from project URL
+    if project_repo_url and task_repo_url != project_repo_url:
+        logger.info(
+            f"GitHub gate: Task references repo {task_repo_url} (from {task_source}), "
+            f"which differs from project default {project_repo_url}. "
+            f"Using task-specific repo."
+        )
+
+    return GitHubFetchDecision(
+        should_fetch=True,
+        repo_url=task_repo_url,
+        source=task_source,
+        reason=f"Repository URL found via {task_source}",
+    )
 
 
 def extract_confluence_topics(
@@ -1305,13 +1566,16 @@ def extract_github_context(
     refined_confluence: RefinedConfluenceContext | None,
     llm_client=None,
     config: dict | None = None,
+    decision: GitHubFetchDecision | None = None,
 ) -> GitHubContext:
     """
     Extract GitHub repository context with Confluence-based deduplication.
 
     Priority for repository URL:
     1. Jira issue description
-    2. Confluence Project Passport
+    2. Assignee comments
+    3. Custom field (project_link)
+    4. Confluence Project Passport
 
     Args:
         mcp: MCP client manager
@@ -1319,6 +1583,7 @@ def extract_github_context(
         refined_confluence: Confluence context for deduplication
         llm_client: Optional LLM client for code snippet selection
         config: Optional config dict
+        decision: Optional pre-evaluated gate decision (skips internal URL discovery)
 
     Returns:
         GitHubContext with repository information
@@ -1337,21 +1602,28 @@ def extract_github_context(
     # Phase 1: Repository URL Discovery
     # =========================================================================
 
-    # Priority 1: Extract from Jira description
-    repo_url = extract_github_url(jira_context.description)
-    if repo_url:
-        context.discovery_source = "jira_description"
-        logger.info(f"Stage 3b: Found GitHub URL in Jira description: {repo_url}")
+    if decision and decision.repo_url:
+        # URL already discovered by gate function
+        repo_url = decision.repo_url
+        context.discovery_source = decision.source
+        logger.info(
+            f"Stage 3b: Using URL from gate decision: {repo_url} " f"(source={decision.source})"
+        )
+    else:
+        # Fallback: original discovery logic (backward compatibility)
+        repo_url = extract_github_url(jira_context.description)
+        if repo_url:
+            context.discovery_source = "jira_description"
+            logger.info(f"Stage 3b: Found GitHub URL in Jira description: {repo_url}")
 
-    # Priority 2: Extract from Confluence Project Passport
-    if not repo_url and refined_confluence:
-        for doc in refined_confluence.core_documents:
-            if "passport" in doc.title.lower():
-                repo_url = extract_github_url(doc.content)
-                if repo_url:
-                    context.discovery_source = "confluence_passport"
-                    logger.info(f"Stage 3b: Found GitHub URL in Project Passport: {repo_url}")
-                    break
+        if not repo_url and refined_confluence:
+            for doc in refined_confluence.core_documents:
+                if "passport" in doc.title.lower():
+                    repo_url = extract_github_url(doc.content)
+                    if repo_url:
+                        context.discovery_source = "confluence_passport"
+                        logger.info(f"Stage 3b: Found GitHub URL in Project Passport: {repo_url}")
+                        break
 
     # No repository found - new project
     if not repo_url:
@@ -1427,21 +1699,25 @@ def extract_github_context(
     for config_file in config_files:
         # Skip tech stack details if covered in Confluence
         if "tech_stack" in confluence_topics and config_file in ["package.json", "pyproject.toml"]:
-            context.configs.append(ConfigSummary(
-                path=config_file,
-                summary="Tech stack documented in Confluence",
-                in_confluence=True,
-            ))
+            context.configs.append(
+                ConfigSummary(
+                    path=config_file,
+                    summary="Tech stack documented in Confluence",
+                    in_confluence=True,
+                )
+            )
             continue
 
         try:
             content = mcp.github_get_file_contents(owner, repo_name, config_file)
             summary = _summarize_config_file(config_file, content)
-            context.configs.append(ConfigSummary(
-                path=config_file,
-                summary=summary,
-                in_confluence=False,
-            ))
+            context.configs.append(
+                ConfigSummary(
+                    path=config_file,
+                    summary=summary,
+                    in_confluence=False,
+                )
+            )
         except Exception:
             # File doesn't exist - skip silently
             pass
@@ -1466,7 +1742,9 @@ def extract_github_context(
     # 3.6: Search for relevant code snippets based on Jira keywords - optional
     if llm_client and "tech_stack" not in confluence_topics:
         try:
-            keywords = _extract_search_keywords(jira_context.summary + " " + jira_context.description)
+            keywords = _extract_search_keywords(
+                jira_context.summary + " " + jira_context.description
+            )
             query = f"repo:{owner}/{repo_name} {keywords}"
             search_results = mcp.github_search_code(query)
             context.snippets = _parse_code_search_results(search_results, mcp, owner, repo_name)
@@ -1495,12 +1773,13 @@ def _parse_repo_structure(response: str) -> RepoStructure:
     # Try to parse as JSON array (GitHub API format)
     try:
         import json
+
         # Response might be JSON array or formatted text
         if response.strip().startswith("["):
             items = json.loads(response)
         else:
             # Try to extract JSON from response
-            json_match = re.search(r'\[[\s\S]*\]', response)
+            json_match = re.search(r"\[[\s\S]*\]", response)
             if json_match:
                 items = json.loads(json_match.group())
             else:
@@ -1643,12 +1922,14 @@ def _parse_code_search_results(
             lines = content.split("\n")[:50]
             snippet_content = "\n".join(lines)
 
-            snippets.append(CodeSnippet(
-                path=path,
-                lines="1-50",
-                content=snippet_content,
-                relevance="Matched search keywords from task",
-            ))
+            snippets.append(
+                CodeSnippet(
+                    path=path,
+                    lines="1-50",
+                    content=snippet_content,
+                    relevance="Matched search keywords from task",
+                )
+            )
         except Exception:
             pass
 
@@ -1658,6 +1939,7 @@ def _parse_code_search_results(
 # =============================================================================
 # Phase 0.5: Assignee Feedback Extraction
 # =============================================================================
+
 
 def has_existing_phase0_analysis(context: ExecutionContext) -> bool:
     """
@@ -1862,7 +2144,9 @@ def _find_templates_folder(mcp: MCPClientManager, space_keys: list[str]) -> str 
                         )
                         return pages[0]["id"]
             except Exception as e:
-                logger.warning(f"Template Compliance: Error searching for '{keyword}' in '{space_key}': {e}")
+                logger.warning(
+                    f"Template Compliance: Error searching for '{keyword}' in '{space_key}': {e}"
+                )
 
     return None
 
@@ -1916,6 +2200,7 @@ def _find_template_page(
 # Stage 4: Data Aggregation
 # =============================================================================
 
+
 def build_execution_context(
     issue_key: str,
     jira_context: JiraContext,
@@ -1958,6 +2243,7 @@ def build_execution_context(
 # =============================================================================
 # Full Pipeline: Stages 1-4
 # =============================================================================
+
 
 def build_context_pipeline(
     mcp: MCPClientManager,
@@ -2048,17 +2334,42 @@ def build_refined_context_pipeline(
         config=config,
     )
 
-    # Stage 3b: GitHub Context (with Confluence deduplication)
+    # Stage 3b: GitHub Context (with conditional gate + Confluence deduplication)
     github_context = None
     if mcp.github_available():
-        logger.info("Stage 3b: Extracting GitHub context")
-        github_context = extract_github_context(
-            mcp=mcp,
+        # Evaluate gate: should we fetch GitHub context?
+        decision = should_fetch_github_context(
             jira_context=jira_context,
             refined_confluence=refined_confluence,
-            llm_client=llm_client,
-            config=config,
         )
+
+        if decision.should_fetch:
+            logger.info(f"Stage 3b: Gate PASSED — {decision.reason}")
+            github_context = extract_github_context(
+                mcp=mcp,
+                jira_context=jira_context,
+                refined_confluence=refined_confluence,
+                llm_client=llm_client,
+                config=config,
+                decision=decision,
+            )
+            # Store override tracking URLs
+            if github_context:
+                github_context.task_repo_url = decision.repo_url
+                # Find project_repo_url from Confluence for override tracking
+                project_repo_url = None
+                if refined_confluence:
+                    for doc in refined_confluence.core_documents:
+                        if "passport" in doc.title.lower():
+                            project_repo_url = extract_github_url(doc.content)
+                            break
+                github_context.project_repo_url = project_repo_url
+        else:
+            logger.info(f"Stage 3b: Gate SKIPPED — {decision.reason}")
+            github_context = GitHubContext(
+                status=RepoStatus.SKIPPED,
+                skip_reason=decision.reason,
+            )
     else:
         logger.info("Stage 3b: GitHub MCP not available - skipping")
 

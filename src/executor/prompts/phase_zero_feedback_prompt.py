@@ -4,7 +4,6 @@ from ..models.execution_context import ExecutionContext, ConfluenceTemplate
 from .template_compliance import build_template_compliance_section
 from .constants import LAYER_CODES_BLOCK
 
-
 PHASE_ZERO_FEEDBACK_SYSTEM_PROMPT = f"""You are an AI Requirements Analyst Agent performing a feedback incorporation pass (Phase 0.5).
 
 You previously analyzed a Jira backlog issue and raised clarification questions. The task assignee has now provided answers in comments. Your job is to incorporate the feedback and refine the analysis.
@@ -23,7 +22,7 @@ Your response MUST be valid XML following the SAME structure as Phase 0:
 
 ```xml
 <phase_0_analysis>
-  <feature_type>update_existing|new_feature</feature_type>
+  <feature_type>update_existing|new_feature|documentation_only|process</feature_type>
 
   <chain_of_thought>
     Updated reasoning incorporating the assignee's feedback.
@@ -101,9 +100,7 @@ def build_phase_zero_feedback_prompt(
     # Format assignee feedback
     feedback_lines = []
     for i, fb in enumerate(assignee_feedback, 1):
-        feedback_lines.append(
-            f"### Comment {i} — {fb['author']} ({fb['created']})\n\n{fb['body']}"
-        )
+        feedback_lines.append(f"### Comment {i} — {fb['author']} ({fb['created']})\n\n{fb['body']}")
     feedback_text = "\n\n---\n\n".join(feedback_lines)
 
     # Template compliance section
@@ -146,4 +143,22 @@ The task assignee has provided the following answers/comments:
 6. Flag any NEW blocking questions that arose from the feedback
 
 Respond with the XML structure specified in your instructions. Nothing else.
+"""
+
+
+PHASE05_RETRY_PROMPT_TEMPLATE = """Your previous Phase 0.5 feedback analysis had validation errors. Fix them.
+
+## Validation Errors:
+{errors}
+
+## Your Previous Response:
+```xml
+{previous_response}
+```
+
+## Instructions:
+Regenerate the COMPLETE Phase 0.5 XML analysis, fixing ALL validation errors listed above.
+Keep all valid content from your previous response — only fix the missing/invalid sections.
+
+Respond with the XML structure specified in your system instructions. Nothing else.
 """

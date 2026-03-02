@@ -229,7 +229,7 @@ class MCPClient:
         Returns:
             Tool result as string
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             self._executor,
             self.call_tool,
@@ -453,7 +453,15 @@ class MCPClientManager:
         raw = self.clients["jira"].call_tool("jira_get_issue_links", {"issue_key": issue_key})
         if not raw:
             return []
-        return json.loads(raw)
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError) as e:
+            logger.warning(f"Failed to parse issue links for {issue_key}: {e}")
+            return []
+        if not isinstance(parsed, list):
+            logger.warning(f"Expected list for issue links of {issue_key}, got {type(parsed).__name__}")
+            return []
+        return parsed
 
     def confluence_get_page(
         self, page_id: str | None = None, space_key: str | None = None, title: str | None = None

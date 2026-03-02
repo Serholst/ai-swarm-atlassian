@@ -11,6 +11,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from ..utils.file_utils import atomic_write
+
 from ..models.execution_context import (
     ExecutionContext,
     JiraContext,
@@ -61,7 +63,7 @@ def save_context(context: ExecutionContext, output_dir: str | Path) -> Path:
         "errors": context.errors,
     }
 
-    filepath.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    atomic_write(filepath, json.dumps(data, indent=2, ensure_ascii=False))
     logger.info(f"Saved context store: {filepath}")
     return filepath
 
@@ -108,6 +110,7 @@ def load_context(issue_key: str, output_dir: str | Path) -> Optional[ExecutionCo
 
 
 # --- Serialization helpers ---
+
 
 def _serialize_jira(jira: Optional[JiraContext]) -> Optional[dict]:
     if not jira:
@@ -236,11 +239,15 @@ def _deserialize_refined_confluence(data: Optional[dict]) -> Optional[RefinedCon
         filter_method=data.get("filter_method", "llm_rerank"),
         project_status=ProjectStatus(data.get("project_status", "existing")),
         core_documents=[
-            RefinedDocument(title=d["title"], url=d["url"], content=d["content"], id=d.get("id", ""))
+            RefinedDocument(
+                title=d["title"], url=d["url"], content=d["content"], id=d.get("id", "")
+            )
             for d in data.get("core_documents", [])
         ],
         supporting_documents=[
-            RefinedDocument(title=d["title"], url=d["url"], content=d["content"], id=d.get("id", ""))
+            RefinedDocument(
+                title=d["title"], url=d["url"], content=d["content"], id=d.get("id", "")
+            )
             for d in data.get("supporting_documents", [])
         ],
         selection_log=_deserialize_selection_log(data.get("selection_log")),
@@ -297,6 +304,9 @@ def _deserialize_github(data: Optional[dict], status_str: Optional[str]) -> Opti
         repository_url=meta.get("repository_url"),
         status=status,
         discovery_source=meta.get("discovery_source", "none"),
+        task_repo_url=meta.get("task_repo_url"),
+        project_repo_url=meta.get("project_repo_url"),
+        skip_reason=meta.get("skip_reason", ""),
         owner=meta.get("owner", ""),
         repo_name=meta.get("repo_name", ""),
         default_branch="main",

@@ -4,7 +4,6 @@ from ..models.execution_context import ExecutionContext, ConfluenceTemplate, Pro
 from .template_compliance import build_template_compliance_section
 from .constants import LAYER_CODES_BLOCK
 
-
 PHASE_ZERO_SYSTEM_PROMPT = f"""You are an AI Requirements Analyst Agent. Your task is to transform a raw Jira backlog description into a structured Use Case and Definition of Ready.
 
 ## Your Responsibilities
@@ -21,7 +20,7 @@ Your response MUST be valid XML following this exact structure:
 
 ```xml
 <phase_0_analysis>
-  <feature_type>update_existing|new_feature</feature_type>
+  <feature_type>update_existing|new_feature|documentation_only|process</feature_type>
 
   <chain_of_thought>
     Step-by-step reasoning linking raw requirements → domain concepts → system boundaries → architectural impact.
@@ -71,6 +70,8 @@ Your response MUST be valid XML following this exact structure:
 6. **Feature Type Detection:** Compare the Jira description against existing Confluence documentation:
    - If the functionality described overlaps with documented modules/APIs/flows → `update_existing`
    - If no overlap found or project has no documentation → `new_feature`
+   - If the task is purely about writing/updating documentation with no code changes → `documentation_only`
+   - If the task is about workflow, process, or operational changes with no code → `process`
 7. **Testable Criteria:** Every DoR criterion must be verifiable by a human or automated check
 8. **Strict Traceability:** Each work area and DoR criterion must trace back to the Use Case flow
 
@@ -136,11 +137,29 @@ def build_phase_zero_prompt(
 ## Your Task
 
 1. Read the Jira issue description and all available project context above
-2. Determine the feature type: `update_existing` or `new_feature`
+2. Determine the feature type: `update_existing`, `new_feature`, `documentation_only`, or `process`
 3. Build a chain of thought from raw requirements to concrete system actions
 4. Formulate a Use Case with actors, preconditions, flow, and postconditions
 5. Identify work areas by layer, risks, and questions needing human input
 6. Define strict, testable Definition of Ready criteria
 
 Respond with the XML structure specified in your instructions. Nothing else.
+"""
+
+
+PHASE0_RETRY_PROMPT_TEMPLATE = """Your previous Phase 0 analysis had validation errors. Fix them.
+
+## Validation Errors:
+{errors}
+
+## Your Previous Response:
+```xml
+{previous_response}
+```
+
+## Instructions:
+Regenerate the COMPLETE Phase 0 XML analysis, fixing ALL validation errors listed above.
+Keep all valid content from your previous response — only fix the missing/invalid sections.
+
+Respond with the XML structure specified in your system instructions. Nothing else.
 """

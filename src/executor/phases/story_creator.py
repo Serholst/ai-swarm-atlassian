@@ -1,23 +1,152 @@
 """
 Story Creator — creates Jira Story issues from approved decomposition.
 
-Used via CLI: python3 execute.py --create-stories PROJ-123
+Called automatically by human_plan_review_handler when --task detects
+[PLAN REVIEW] is Done on a "Human Plan Review" issue.
 
 Workflow:
 1. Check that [PLAN REVIEW] task is marked Done
 2. Re-extract stories from Technical Decomposition comment
-3. Create Jira Story issues linked to parent Feature
+3. Create Jira Story issues linked to parent Feature (idempotent)
 """
 
+import json
 import re
 import logging
-from typing import Optional
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Literal, Optional
 
 from ..constants import extract_project_key, get_blocking_link_type
 from ..mcp.client import MCPClientManager
 from ..models.decomposition import DecomposedStory
+from ..utils.file_utils import atomic_write
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Creation Report (Gap 2)
+# =============================================================================
+
+
+@dataclass
+class StoryCreationOutcome:
+    """Outcome of creating (or skipping) a single story."""
+
+    story: DecomposedStory
+    jira_key: Optional[str] = None  # None if failed
+    status: Literal["created", "skipped", "failed"] = "failed"
+    error: Optional[str] = None
+
+    def to_manifest_dict(self) -> dict:
+        return {
+            "order": self.story.order,
+            "jira_key": self.jira_key,
+            "summary": f"[{self.story.layer}] {self.story.title}",
+            "status": self.status,
+            "error": self.error,
+        }
+
+
+@dataclass
+class StoryCreationReport:
+    """Aggregated report of all story creation outcomes."""
+
+    outcomes: list[StoryCreationOutcome] = field(default_factory=list)
+
+    @property
+    def created(self) -> list[tuple[DecomposedStory, str]]:
+        return [(o.story, o.jira_key) for o in self.outcomes if o.status == "created"]
+
+    @property
+    def skipped(self) -> list[StoryCreationOutcome]:
+        return [o for o in self.outcomes if o.status == "skipped"]
+
+    @property
+    def failed(self) -> list[StoryCreationOutcome]:
+        return [o for o in self.outcomes if o.status == "failed"]
+
+    @property
+    def created_or_skipped(self) -> list[tuple[DecomposedStory, str]]:
+        """All stories that exist in Jira (created this run or previously)."""
+        return [
+            (o.story, o.jira_key)
+            for o in self.outcomes
+            if o.status in ("created", "skipped") and o.jira_key
+        ]
+
+
+# =============================================================================
+# Manifest (Gap 1)
+# =============================================================================
+
+
+def _manifest_path(parent_key: str, output_dir: str = "outputs") -> Path:
+    issue_dir = Path(output_dir) / parent_key
+    issue_dir.mkdir(parents=True, exist_ok=True)
+    return issue_dir / f"{parent_key}_stories_manifest.json"
+
+
+def _load_manifest(parent_key: str, output_dir: str = "outputs") -> dict:
+    """Load existing story creation manifest, or return empty dict."""
+    path = _manifest_path(parent_key, output_dir)
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(f"Could not load manifest {path}: {e}")
+    return {}
+
+
+def _save_manifest(
+    parent_key: str,
+    report: StoryCreationReport,
+    output_dir: str = "outputs",
+) -> Path:
+    """Save creation manifest (atomic write)."""
+    data = {
+        "parent_key": parent_key,
+        "created_at": datetime.now().isoformat(),
+        "stories": [o.to_manifest_dict() for o in report.outcomes],
+    }
+    path = _manifest_path(parent_key, output_dir)
+    atomic_write(path, json.dumps(data, indent=2, ensure_ascii=False))
+    logger.info(f"Saved story manifest: {path}")
+    return path
+
+
+def _get_existing_child_summaries(
+    mcp: MCPClientManager, parent_key: str
+) -> dict[str, str]:
+    """
+    Query Jira for existing child stories of a parent issue.
+
+    Returns:
+        Dict mapping normalized summary -> jira_key for existing children.
+    """
+    jql = f'parent = "{parent_key}" AND issuetype = Story'
+    try:
+        result = mcp.jira_search_issues(jql, max_results=100)
+    except Exception as e:
+        logger.warning(f"Could not query existing children for {parent_key}: {e}")
+        return {}
+
+    existing: dict[str, str] = {}
+    if isinstance(result, str):
+        # MCP returns formatted text — parse keys and summaries
+        for line in result.splitlines():
+            key_match = re.search(r"\*\*([A-Z][A-Z0-9]*-\d+)\*\*", line)
+            if key_match:
+                key = key_match.group(1)
+                # Try to extract summary after the key
+                summary_match = re.search(
+                    r"\*\*[A-Z][A-Z0-9]*-\d+\*\*[:\s]*(.+?)(?:\s*\||\s*$)", line
+                )
+                if summary_match:
+                    existing[summary_match.group(1).strip().lower()] = key
+    return existing
 
 
 def _is_empty_search(result: str | None) -> bool:
@@ -349,13 +478,15 @@ def create_jira_stories(
     project_key: str,
     stories: list[DecomposedStory],
     config: dict,
-) -> list[tuple[DecomposedStory, str]]:
+    output_dir: str = "outputs",
+) -> StoryCreationReport:
     """
-    Create Jira Story issues and link to parent Feature.
+    Create Jira Story issues and link to parent Feature (idempotent).
 
-    For each story:
-    1. Create Story issue with "[LAYER] title" summary
-    2. Link as child of parent Feature
+    Duplicate detection:
+    1. Load manifest from previous run — skip stories already created
+    2. Query existing child stories via JQL — skip exact summary matches
+    3. Create only genuinely new stories
 
     Args:
         mcp: MCP client manager
@@ -363,19 +494,53 @@ def create_jira_stories(
         project_key: Jira project key
         stories: List of DecomposedStory objects
         config: SDLC config dict
+        output_dir: Output directory for manifest file
 
     Returns:
-        List of (story, created_issue_key) tuples
+        StoryCreationReport with per-story outcomes
     """
     parent_link_type = config.get("jira", {}).get("parent_link_type", "Parent")
-    created: list[tuple[DecomposedStory, str]] = []
+    report = StoryCreationReport()
+
+    # --- Duplicate detection: manifest ---
+    manifest = _load_manifest(parent_key, output_dir)
+    manifest_stories: dict[int, dict] = {}
+    for entry in manifest.get("stories", []):
+        manifest_stories[entry.get("order", -1)] = entry
+
+    # --- Duplicate detection: existing Jira children ---
+    existing_children = _get_existing_child_summaries(mcp, parent_key)
 
     for story in stories:
         summary = f"[{story.layer}] {story.title}"
-        # Truncate summary to Jira limit (255 chars)
         if len(summary) > 255:
             summary = summary[:252] + "..."
 
+        # Check 1: Already in manifest with valid key
+        manifest_entry = manifest_stories.get(story.order)
+        if manifest_entry and manifest_entry.get("status") == "created":
+            existing_key = manifest_entry.get("jira_key")
+            if existing_key:
+                logger.info(f"Story already exists (manifest): {existing_key}, skipping")
+                report.outcomes.append(
+                    StoryCreationOutcome(
+                        story=story, jira_key=existing_key, status="skipped"
+                    )
+                )
+                continue
+
+        # Check 2: Existing child in Jira with matching summary
+        match_key = existing_children.get(summary.lower())
+        if match_key:
+            logger.info(f"Story already exists (Jira child): {match_key}, skipping")
+            report.outcomes.append(
+                StoryCreationOutcome(
+                    story=story, jira_key=match_key, status="skipped"
+                )
+            )
+            continue
+
+        # Create new story
         description = build_story_description(story)
 
         try:
@@ -384,34 +549,55 @@ def create_jira_stories(
                 issue_type="Story",
                 summary=summary,
                 description=description,
+                parent_key=parent_key,
             )
 
-            # Parse key from result
             key_match = re.search(r"([A-Z][A-Z0-9]*-\d+)", result)
             if not key_match:
                 logger.error(f"Could not parse issue key from: {result}")
+                report.outcomes.append(
+                    StoryCreationOutcome(
+                        story=story, status="failed",
+                        error=f"Could not parse key from: {result[:100]}",
+                    )
+                )
                 continue
 
             story_key = key_match.group(1)
-            logger.info(f"Created story: {story_key} - {summary}")
+            parent_field_ok = "PARENT_FIELD_FAILED" not in result
+            logger.info(f"Created story: {story_key} - {summary} (parent_field={'ok' if parent_field_ok else 'failed'})")
 
-            # Link as child of parent Feature
-            try:
-                mcp.jira_link_issues(
-                    from_key=parent_key,
-                    to_key=story_key,
-                    link_type=parent_link_type,
+            # Fallback: if parent field was rejected (Classic Jira / scheme mismatch),
+            # establish relationship via issueLink
+            if not parent_field_ok:
+                try:
+                    mcp.jira_link_issues(
+                        from_key=parent_key,
+                        to_key=story_key,
+                        link_type=parent_link_type,
+                    )
+                    logger.info(f"Linked {story_key} as child of {parent_key} via issueLink")
+                except Exception as e:
+                    logger.warning(f"Failed to link {story_key} to {parent_key}: {e}")
+
+            report.outcomes.append(
+                StoryCreationOutcome(
+                    story=story, jira_key=story_key, status="created"
                 )
-                logger.info(f"Linked {story_key} as child of {parent_key}")
-            except Exception as e:
-                logger.warning(f"Failed to link {story_key} to {parent_key}: {e}")
-
-            created.append((story, story_key))
+            )
 
         except Exception as e:
             logger.error(f"Failed to create story '{summary}': {e}")
+            report.outcomes.append(
+                StoryCreationOutcome(
+                    story=story, status="failed", error=str(e)
+                )
+            )
 
-    return created
+    # Save manifest for resume-on-failure
+    _save_manifest(parent_key, report, output_dir)
+
+    return report
 
 
 def create_dependency_links(

@@ -477,6 +477,23 @@ class JiraAPIClient:
         payload = {"transition": {"id": transition_id}}
         self._request("POST", url, json=payload)
 
+        # Verify transition actually succeeded (detects race with another process)
+        try:
+            issue_data = self.get_issue(issue_key)
+            current_status = (
+                issue_data.get("fields", {}).get("status", {}).get("name", "")
+            )
+            if current_status.lower() != target_status.lower():
+                raise RuntimeError(
+                    f"Transition conflict: expected '{target_status}', "
+                    f"but issue is in '{current_status}'. "
+                    f"Another process may have modified the issue."
+                )
+        except RuntimeError:
+            raise
+        except Exception as e:
+            logger.warning(f"Could not verify transition for {issue_key}: {e}")
+
     def create_issue(
         self,
         project_key: str,
@@ -488,16 +505,15 @@ class JiraAPIClient:
         """
         Create a new issue.
 
-        Note: In Classic Jira, 'parent' field only works for Sub-task types.
-        For Feature→Story hierarchy, create the issue first then use link_issues()
-        with appropriate link type (e.g., "Parent", "is child of").
+        Sets the parent-child hierarchy via the 'parent' field (Jira Cloud).
+        This works for any issue type: Feature→Story, Story→Sub-task, etc.
 
         Args:
             project_key: Jira project key
             issue_type: Issue type name (Feature, Story, Task, Sub-task)
             summary: Issue title
             description: Issue description (Markdown)
-            parent_key: Parent issue key (only used for Sub-task in Classic Jira)
+            parent_key: Parent issue key (sets parent-child hierarchy)
 
         Returns:
             Created issue data with 'key' field
@@ -513,16 +529,30 @@ class JiraAPIClient:
         if description:
             fields["description"] = MarkdownToADF.convert(description)
 
-        # In Classic Jira, parent field only works for Sub-task types
-        # For other hierarchies (Feature→Story), use link_issues() after creation
-        if parent_key and issue_type.lower() in ("sub-task", "subtask"):
+        if parent_key:
             fields["parent"] = {"key": parent_key}
-        elif parent_key:
-            logger.info(f"Note: parent_key ignored for {issue_type} - use link_issues() instead")
 
         payload = {"fields": fields}
         logger.info(f"Creating {issue_type} in {project_key}: {summary[:50]}...")
-        result = self._request("POST", url, json=payload).json()
+
+        try:
+            result = self._request("POST", url, json=payload).json()
+        except requests.exceptions.HTTPError as e:
+            # If parent field caused 400, retry without it (Classic Jira / incompatible scheme)
+            resp = getattr(e, "response", None)
+            if resp is not None and resp.status_code == 400 and parent_key:
+                body = resp.text[:500] if resp.text else "(empty)"
+                logger.warning(
+                    f"Create with parent field failed (400): {body}. "
+                    f"Retrying without parent — use link_issues() after creation."
+                )
+                fields.pop("parent", None)
+                payload = {"fields": fields}
+                result = self._request("POST", url, json=payload).json()
+                result["_parent_field_failed"] = True
+            else:
+                raise
+
         logger.info(f"Created issue: {result.get('key', 'unknown')}")
         return result
 
@@ -549,7 +579,34 @@ class JiraAPIClient:
         try:
             self._request("POST", url, json=payload)
         except requests.exceptions.HTTPError as e:
-            body = e.response.text if e.response is not None else "no body"
+            resp = getattr(e, "response", None)
+            status = resp.status_code if resp is not None else 0
+            body = resp.text[:500] if resp is not None and resp.text else "no body"
+
+            # 404 means the link type name doesn't exist — try auto-resolving
+            if status == 404:
+                resolved = self.resolve_parent_link_type(link_type)
+                if resolved and resolved != link_type:
+                    logger.warning(
+                        f"Link type '{link_type}' not found. "
+                        f"Auto-resolved to '{resolved}', retrying..."
+                    )
+                    payload["type"]["name"] = resolved
+                    try:
+                        self._request("POST", url, json=payload)
+                        logger.info(
+                            f"Linked {from_key}->{to_key} via auto-resolved type '{resolved}'"
+                        )
+                        return
+                    except requests.exceptions.HTTPError as e2:
+                        body2 = getattr(e2, "response", None)
+                        body2 = body2.text[:500] if body2 is not None and body2.text else "no body"
+                        logger.error(
+                            f"link_issues retry also failed [{resolved}] "
+                            f"{from_key}->{to_key}: {e2} | Jira response: {body2}"
+                        )
+                        raise e2
+
             logger.error(
                 f"link_issues failed [{link_type}] {from_key}->{to_key}: {e} | Jira response: {body}"
             )
@@ -586,6 +643,48 @@ class JiraAPIClient:
         url = f"{self.base_url}/rest/api/3/issueLinkType"
         return self._request("GET", url).json().get("issueLinkTypes", [])
 
+    def resolve_parent_link_type(self, preferred: str = "Parent") -> str | None:
+        """Find an available link type suitable for parent-child relationships.
+
+        Tries *preferred* first, then falls back to common hierarchy-related
+        names.  Returns the link-type **name** or ``None`` if nothing matches.
+        """
+        try:
+            available = self.get_link_types()
+        except Exception:
+            return None
+
+        names = {lt["name"] for lt in available}
+        # Also build a lowercase lookup for fuzzy matching
+        lower_map = {lt["name"].lower(): lt["name"] for lt in available}
+
+        # 1. Exact match on preferred
+        if preferred in names:
+            return preferred
+
+        # 2. Common parent-child link type names across Jira configurations
+        candidates = [
+            "Parent",
+            "Hierarchy",
+            "Parent/Child",
+            "Epic-Story Link",
+            "is parent of",
+        ]
+        for c in candidates:
+            if c in names:
+                return c
+            if c.lower() in lower_map:
+                return lower_map[c.lower()]
+
+        # 3. Fuzzy: any type whose inward/outward contains "parent" or "child"
+        for lt in available:
+            inward = lt.get("inward", "").lower()
+            outward = lt.get("outward", "").lower()
+            if "parent" in inward or "parent" in outward or "child" in inward or "child" in outward:
+                return lt["name"]
+
+        return None
+
 
 def extract_adf_text(adf: dict) -> str:
     """Extract plain text from Atlassian Document Format with basic formatting."""
@@ -596,7 +695,22 @@ def extract_adf_text(adf: dict) -> str:
         content = node.get("content", [])
 
         if node_type == "text":
-            return node.get("text", "")
+            text = node.get("text", "")
+            marks = node.get("marks", [])
+            for mark in marks:
+                mark_type = mark.get("type", "")
+                if mark_type == "strong":
+                    text = f"**{text}**"
+                elif mark_type == "em":
+                    text = f"*{text}*"
+                elif mark_type == "code":
+                    text = f"`{text}`"
+                elif mark_type == "strike":
+                    text = f"~~{text}~~"
+                elif mark_type == "link":
+                    href = mark.get("attrs", {}).get("href", "")
+                    text = f"[{text}]({href})"
+            return text
 
         if node_type == "hardBreak":
             return "\n"
@@ -638,7 +752,7 @@ def extract_adf_text(adf: dict) -> str:
         if node_type == "expand":
             title = node.get("attrs", {}).get("title", "")
             text = "".join(traverse(child) for child in content)
-            return f"{title}\n{text}\n"
+            return f"## {title}\n{text}\n"
 
         if node_type == "rule":
             return "---\n"
@@ -1005,7 +1119,10 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
 
             result = jira_client.create_issue(project_key, issue_type, summary, description, parent_key)
             new_key = result.get("key", "")
-            return [TextContent(type="text", text=f"Created issue: {new_key}")]
+            msg = f"Created issue: {new_key}"
+            if result.get("_parent_field_failed"):
+                msg += " [PARENT_FIELD_FAILED]"
+            return [TextContent(type="text", text=msg)]
 
         elif name == "jira_update_description":
             issue_key = arguments["issue_key"]

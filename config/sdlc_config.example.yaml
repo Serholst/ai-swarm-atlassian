@@ -188,6 +188,11 @@ agent:
   require_citations: true
   save_prompt: true
 
+  # API resilience settings
+  api_timeout_seconds: 120          # Request timeout for LLM API calls
+  max_api_retries: 3                # Max retries on transient API errors (429/502/503/504)
+  backoff_base_seconds: 2           # Base delay for exponential backoff (2s, 4s, 8s)
+
   # Content budget (max chars per document injected into LLM prompt)
   content_budget:
     core_doc_max_chars: 12000       # Project Passport, Logical Architecture

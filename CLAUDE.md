@@ -27,9 +27,6 @@ python execute.py --phase0 PROJ-123
 # Refinement (re-run Stage 5 with human feedback, no MCP needed)
 python execute.py --refine PROJ-123 --feedback "Split step 3 into BE and FE"
 
-# Story creation (from approved decomposition)
-python execute.py --create-stories PROJ-123
-
 # Tests
 pytest tests/unit/                          # unit tests only
 pytest tests/unit/test_validation.py        # single test file

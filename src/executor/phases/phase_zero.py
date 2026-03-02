@@ -28,15 +28,61 @@ from openai import OpenAI
 
 from ..mcp.client import MCPClientManager
 from ..models.execution_context import ExecutionContext
+from ..utils.file_utils import atomic_write
 from ..models.llm_metrics import LLMCallMetrics, ExecutionMetrics
-from ..prompts.phase_zero_prompt import PHASE_ZERO_SYSTEM_PROMPT, build_phase_zero_prompt
+from ..prompts.phase_zero_prompt import (
+    PHASE_ZERO_SYSTEM_PROMPT,
+    build_phase_zero_prompt,
+    PHASE0_RETRY_PROMPT_TEMPLATE,
+)
 
 logger = logging.getLogger(__name__)
 
 
 # =============================================================================
+# API Retry Helper
+# =============================================================================
+
+# Transient HTTP errors that warrant a retry
+_TRANSIENT_API_ERRORS = {429, 502, 503, 504}
+_MAX_API_RETRIES = 3
+_BACKOFF_BASE_SECONDS = 2
+
+
+def _call_llm_with_retry(
+    llm_client: OpenAI,
+    messages: list[dict],
+    model: str,
+    temperature: float = 0.2,
+    max_tokens: int = 8192,
+) -> object:
+    """Call LLM API with exponential backoff for transient errors."""
+    for api_attempt in range(1, _MAX_API_RETRIES + 1):
+        try:
+            return llm_client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        except Exception as e:
+            status_code = getattr(e, "status_code", None)
+            if status_code in _TRANSIENT_API_ERRORS and api_attempt < _MAX_API_RETRIES:
+                wait = _BACKOFF_BASE_SECONDS * (2 ** (api_attempt - 1))
+                logger.warning(
+                    f"LLM API error {status_code}, "
+                    f"retry {api_attempt}/{_MAX_API_RETRIES} in {wait}s"
+                )
+                time.sleep(wait)
+                continue
+            raise
+    raise RuntimeError(f"Max API retries ({_MAX_API_RETRIES}) exhausted")  # pragma: no cover
+
+
+# =============================================================================
 # Data Models
 # =============================================================================
+
 
 @dataclass
 class PhaseZeroResponse:
@@ -45,7 +91,7 @@ class PhaseZeroResponse:
     raw_content: str
 
     # Parsed XML sections
-    feature_type: str = ""  # "update_existing" | "new_feature"
+    feature_type: str = ""  # "update_existing" | "new_feature" | "documentation_only" | "process"
     chain_of_thought: str = ""
     use_case: str = ""
     work_areas: str = ""
@@ -78,6 +124,7 @@ class PhaseZeroResult:
 # =============================================================================
 # XML Parsing
 # =============================================================================
+
 
 def _extract_xml_tag(content: str, tag: str) -> str:
     """Extract content between XML tags. Returns empty string if not found."""
@@ -128,6 +175,7 @@ def parse_phase_zero_response(raw: str) -> PhaseZeroResponse:
 # Validation
 # =============================================================================
 
+
 def validate_phase_zero(response: PhaseZeroResponse) -> list[str]:
     """
     Validate Phase 0 response has all required sections.
@@ -146,14 +194,20 @@ def validate_phase_zero(response: PhaseZeroResponse) -> list[str]:
         errors.append("Missing <use_case> section")
     if not response.definition_of_ready:
         errors.append("Missing <definition_of_ready> section")
+    valid_feature_types = ("update_existing", "new_feature", "documentation_only", "process")
     if not response.feature_type:
-        errors.append("Missing <feature_type> (expected 'update_existing' or 'new_feature')")
-    elif response.feature_type not in ("update_existing", "new_feature"):
-        errors.append(f"Invalid <feature_type>: '{response.feature_type}' (expected 'update_existing' or 'new_feature')")
+        errors.append(f"Missing <feature_type> (expected one of: {', '.join(valid_feature_types)})")
+    elif response.feature_type not in valid_feature_types:
+        errors.append(
+            f"Invalid <feature_type>: '{response.feature_type}' "
+            f"(expected one of: {', '.join(valid_feature_types)})"
+        )
     if not response.complexity_estimate:
         errors.append("Missing complexity estimate attribute (expected S|M|L|XL)")
     elif response.complexity_estimate not in ("S", "M", "L", "XL"):
-        errors.append(f"Invalid complexity estimate: '{response.complexity_estimate}' (expected S|M|L|XL)")
+        errors.append(
+            f"Invalid complexity estimate: '{response.complexity_estimate}' (expected S|M|L|XL)"
+        )
 
     # Check use_case has required sub-elements
     if response.use_case:
@@ -170,9 +224,43 @@ def validate_phase_zero(response: PhaseZeroResponse) -> list[str]:
     return errors
 
 
+# Errors that MUST prevent Jira writes — missing critical user-facing sections
+_BLOCKING_ERROR_PATTERNS = (
+    "Missing <use_case>",
+    "Missing <definition_of_ready>",
+)
+
+
+def classify_validation_errors(
+    errors: list[str],
+) -> tuple[list[str], list[str]]:
+    """
+    Split validation errors into blocking and non-blocking.
+
+    Blocking errors prevent Jira writes entirely (critical sections missing).
+    Non-blocking errors are logged as warnings but Jira write proceeds.
+
+    Returns:
+        (blocking_errors, non_blocking_errors)
+    """
+    blocking: list[str] = []
+    non_blocking: list[str] = []
+    for err in errors:
+        if any(pat in err for pat in _BLOCKING_ERROR_PATTERNS):
+            blocking.append(err)
+        else:
+            non_blocking.append(err)
+    return blocking, non_blocking
+
+
+# Max validation retries (1 retry = 2 total attempts, lower than Stage 5)
+MAX_PHASE0_VALIDATION_RETRIES = 1
+
+
 # =============================================================================
 # Jira Description Builder (ADF with Expand blocks)
 # =============================================================================
+
 
 class _ADF:
     """Minimal ADF builder for Phase 0 description output.
@@ -204,26 +292,30 @@ class _ADF:
         while remaining:
             bold = re.match(r"\*\*([^*]+)\*\*", remaining)
             if bold:
-                result.append({
-                    "type": "text",
-                    "text": bold.group(1),
-                    "marks": [{"type": "strong"}],
-                })
-                remaining = remaining[bold.end():]
+                result.append(
+                    {
+                        "type": "text",
+                        "text": bold.group(1),
+                        "marks": [{"type": "strong"}],
+                    }
+                )
+                remaining = remaining[bold.end() :]
                 continue
             italic = re.match(r"\*([^*]+)\*", remaining)
             if italic:
-                result.append({
-                    "type": "text",
-                    "text": italic.group(1),
-                    "marks": [{"type": "em"}],
-                })
-                remaining = remaining[italic.end():]
+                result.append(
+                    {
+                        "type": "text",
+                        "text": italic.group(1),
+                        "marks": [{"type": "em"}],
+                    }
+                )
+                remaining = remaining[italic.end() :]
                 continue
             plain = re.match(r"[^*]+", remaining)
             if plain:
                 result.append({"type": "text", "text": plain.group()})
-                remaining = remaining[plain.end():]
+                remaining = remaining[plain.end() :]
                 continue
             result.append({"type": "text", "text": remaining[0]})
             remaining = remaining[1:]
@@ -233,20 +325,14 @@ class _ADF:
     def bullet_list(items: list[str]) -> dict:
         return {
             "type": "bulletList",
-            "content": [
-                {"type": "listItem", "content": [_ADF.paragraph(item)]}
-                for item in items
-            ],
+            "content": [{"type": "listItem", "content": [_ADF.paragraph(item)]} for item in items],
         }
 
     @staticmethod
     def ordered_list(items: list[str]) -> dict:
         return {
             "type": "orderedList",
-            "content": [
-                {"type": "listItem", "content": [_ADF.paragraph(item)]}
-                for item in items
-            ],
+            "content": [{"type": "listItem", "content": [_ADF.paragraph(item)]} for item in items],
         }
 
     @staticmethod
@@ -304,7 +390,11 @@ class _ADF:
             # Paragraph (collect consecutive non-special lines)
             para_lines = [line]
             i += 1
-            while i < len(lines) and lines[i].strip() and not re.match(r"^(#{1,6}\s|[-*]\s|\d+\.\s)", lines[i]):
+            while (
+                i < len(lines)
+                and lines[i].strip()
+                and not re.match(r"^(#{1,6}\s|[-*]\s|\d+\.\s)", lines[i])
+            ):
                 para_lines.append(lines[i])
                 i += 1
             nodes.append(_ADF.paragraph(" ".join(para_lines)))
@@ -364,7 +454,8 @@ def _format_questions_markdown(questions_xml: str) -> str:
     """Convert clarification questions XML to Markdown."""
     questions = re.findall(
         r'<question\s+priority="([^"]*)"[^>]*>(.*?)</question>',
-        questions_xml, re.DOTALL,
+        questions_xml,
+        re.DOTALL,
     )
     if not questions:
         return ""
@@ -403,14 +494,22 @@ def build_jira_description_adf(
     Returns:
         ADF document dict ready for Jira API
     """
-    feature_label = "New Feature" if response.feature_type == "new_feature" else "Update Existing"
+    feature_label_map = {
+        "new_feature": "New Feature",
+        "update_existing": "Update Existing",
+        "documentation_only": "Documentation Only",
+        "process": "Process / Workflow",
+    }
+    feature_label = feature_label_map.get(response.feature_type, response.feature_type)
     content = []
 
     # --- Header ---
     content.append(_ADF.heading("Phase 0: Requirements Analysis", 2))
-    content.append(_ADF.paragraph(
-        f"**Feature Type:** {feature_label}  |  **Complexity:** {response.complexity_estimate}"
-    ))
+    content.append(
+        _ADF.paragraph(
+            f"**Feature Type:** {feature_label}  |  **Complexity:** {response.complexity_estimate}"
+        )
+    )
 
     # --- Divider ---
     content.append(_ADF.rule())
@@ -422,24 +521,30 @@ def build_jira_description_adf(
         else ""
     )
     if questions_md:
-        content.append(_ADF.paragraph(
-            "*Clarification questions have been posted as a comment on this issue.*"
-        ))
+        content.append(
+            _ADF.paragraph("*Clarification questions have been posted as a comment on this issue.*")
+        )
         content.append(_ADF.rule())
 
     # --- Expand: Original Requirements ---
     if original_description:
-        content.append(_ADF.expand_block(
-            "Original Requirements",
-            _ADF.markdown_to_nodes(original_description),
-        ))
+        content.append(
+            _ADF.expand_block(
+                "Original Requirements",
+                _ADF.markdown_to_nodes(original_description),
+            )
+        )
 
     # --- Expand: Chain of Thought ---
     cot_md = response.chain_of_thought or "_No chain of thought generated_"
     content.append(_ADF.expand_block("Chain of Thought", _ADF.markdown_to_nodes(cot_md)))
 
     # --- Expand: Use Cases ---
-    use_case_md = _format_use_case_markdown(response.use_case) if response.use_case else "_Use case not generated_"
+    use_case_md = (
+        _format_use_case_markdown(response.use_case)
+        if response.use_case
+        else "_Use case not generated_"
+    )
     work_areas_md = _format_work_areas_markdown(response.work_areas) if response.work_areas else ""
     risks_md = _format_risks_markdown(response.risks) if response.risks else ""
 
@@ -452,21 +557,27 @@ def build_jira_description_adf(
     content.append(_ADF.expand_block("Use Cases", _ADF.markdown_to_nodes(full_use_case_md)))
 
     # --- Expand: Definition of Ready ---
-    dor_md = _format_dor_markdown(response.definition_of_ready) if response.definition_of_ready else "_No criteria_"
+    dor_md = (
+        _format_dor_markdown(response.definition_of_ready)
+        if response.definition_of_ready
+        else "_No criteria_"
+    )
     content.append(_ADF.expand_block("Definition of Ready", _ADF.markdown_to_nodes(dor_md)))
 
     # --- Expand: Complexity Justification ---
     if response.complexity:
-        content.append(_ADF.expand_block(
-            "Complexity Justification",
-            _ADF.markdown_to_nodes(response.complexity),
-        ))
+        content.append(
+            _ADF.expand_block(
+                "Complexity Justification",
+                _ADF.markdown_to_nodes(response.complexity),
+            )
+        )
 
     # --- Footer ---
     content.append(_ADF.rule())
-    content.append(_ADF.paragraph(
-        f"*Generated by AI-SWARM Phase 0 | {issue_key} | Ready for human review*"
-    ))
+    content.append(
+        _ADF.paragraph(f"*Generated by AI-SWARM Phase 0 | {issue_key} | Ready for human review*")
+    )
 
     return {"type": "doc", "version": 1, "content": content}
 
@@ -474,6 +585,7 @@ def build_jira_description_adf(
 # =============================================================================
 # Output File
 # =============================================================================
+
 
 def save_phase_zero_output(
     issue_key: str,
@@ -519,7 +631,7 @@ def save_phase_zero_output(
 {response.raw_content}
 ```
 """
-    filepath.write_text(content, encoding="utf-8")
+    atomic_write(filepath, content)
     return filepath
 
 
@@ -556,6 +668,7 @@ def _load_previous_phase0_xml(output_file: Path) -> str:
 # =============================================================================
 # Phase 0 Executor
 # =============================================================================
+
 
 def execute_phase_zero(
     mcp: MCPClientManager,
@@ -627,10 +740,7 @@ def execute_phase_zero(
     if has_existing_phase0_analysis(execution_context):
         logger.info("Phase 0: Existing Phase 0 analysis detected — checking for assignee feedback")
 
-        assignee_id = (
-            execution_context.jira.assignee_account_id
-            if execution_context.jira else None
-        )
+        assignee_id = execution_context.jira.assignee_account_id if execution_context.jira else None
 
         # Load previous analysis — prefer Phase 0.5 output (latest), fall back to Phase 0
         issue_dir = Path(output_dir) / issue_key
@@ -647,10 +757,11 @@ def execute_phase_zero(
             elif previous_output_file.exists():
                 # Fallback: use output file mtime (backward compatibility)
                 from datetime import timezone
+
                 mtime = previous_output_file.stat().st_mtime
-                phase0_timestamp = datetime.fromtimestamp(
-                    mtime, tz=timezone.utc
-                ).strftime("%Y-%m-%dT%H:%M:%S")
+                phase0_timestamp = datetime.fromtimestamp(mtime, tz=timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%S"
+                )
                 logger.info(f"Phase 0: Fallback to file mtime timestamp: {phase0_timestamp}")
 
             assignee_feedback = extract_assignee_feedback(
@@ -678,9 +789,7 @@ def execute_phase_zero(
                     dry_run=dry_run,
                 )
             else:
-                logger.info(
-                    "Phase 0: No assignee feedback found — re-running Phase 0 from scratch"
-                )
+                logger.info("Phase 0: No assignee feedback found — re-running Phase 0 from scratch")
         else:
             if not assignee_id:
                 logger.info("Phase 0: No assignee account ID — cannot check for feedback")
@@ -712,62 +821,111 @@ def execute_phase_zero(
     issue_dir = Path(output_dir) / issue_key
     issue_dir.mkdir(parents=True, exist_ok=True)
     prompt_file = issue_dir / f"{issue_key}_phase0_prompt.md"
-    prompt_file.write_text(
+    atomic_write(
+        prompt_file,
         f"# Phase 0 Prompt: {issue_key}\n\n"
         f"Generated: {datetime.now().isoformat()}\n"
         f"Model: {model}\n\n---\n\n"
         f"## System Prompt\n\n```\n{PHASE_ZERO_SYSTEM_PROMPT}\n```\n\n---\n\n"
         f"## User Prompt\n\n{user_prompt}\n",
-        encoding="utf-8",
     )
 
-    # --- Step 3: Call LLM ---
-    logger.info(f"Phase 0: Calling LLM ({model})")
-    start_time = time.time()
+    # --- Step 3: Call LLM with validation retry loop ---
+    response = None
+    validation_errors: list[str] = []
+    current_prompt = user_prompt
+    current_system = PHASE_ZERO_SYSTEM_PROMPT
 
-    try:
-        completion = llm_client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": PHASE_ZERO_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.2,
-            max_tokens=8192,
+    for attempt in range(1, MAX_PHASE0_VALIDATION_RETRIES + 2):
+        logger.info(f"Phase 0: Calling LLM ({model}), attempt {attempt}")
+        start_time = time.time()
+
+        try:
+            completion = _call_llm_with_retry(
+                llm_client,
+                messages=[
+                    {"role": "system", "content": current_system},
+                    {"role": "user", "content": current_prompt},
+                ],
+                model=model,
+            )
+
+            raw_content = completion.choices[0].message.content or ""
+            tokens_in = completion.usage.prompt_tokens if completion.usage else 0
+            tokens_out = completion.usage.completion_tokens if completion.usage else 0
+            tokens_used = tokens_in + tokens_out
+            finish_reason = completion.choices[0].finish_reason or ""
+
+        except Exception as e:
+            logger.error(f"Phase 0: LLM call failed: {e}")
+            return PhaseZeroResult(
+                response=PhaseZeroResponse(raw_content=""),
+                jira_updated=False,
+                error=f"LLM call failed: {e}",
+            )
+
+        duration_ms = int((time.time() - start_time) * 1000)
+        logger.info(f"Phase 0: LLM response received ({tokens_used} tokens, {duration_ms}ms)")
+
+        # --- Step 4: Parse and validate ---
+        response = parse_phase_zero_response(raw_content)
+        response.model = model
+        response.tokens_used = tokens_used
+        response.tokens_in = tokens_in
+        response.tokens_out = tokens_out
+        response.finish_reason = finish_reason
+
+        validation_errors = validate_phase_zero(response)
+        if not validation_errors:
+            logger.info("Phase 0: Validation passed")
+            break
+
+        logger.warning(f"Phase 0: Validation errors (attempt {attempt}): {validation_errors}")
+
+        if attempt <= MAX_PHASE0_VALIDATION_RETRIES:
+            # Build retry prompt for next attempt
+            current_prompt = PHASE0_RETRY_PROMPT_TEMPLATE.format(
+                errors="\n".join(f"- {e}" for e in validation_errors),
+                previous_response=raw_content[:6000],
+            )
+        else:
+            logger.error(
+                f"Phase 0: Max validation retries reached. Errors: {validation_errors}"
+            )
+
+    # --- Step 5: Classify errors and gate Jira writes ---
+    blocking_errors, non_blocking_errors = classify_validation_errors(validation_errors)
+
+    if blocking_errors:
+        # Save failed output for debugging but do NOT write to Jira
+        failed_file = issue_dir / f"{issue_key}_phase0_failed.md"
+        atomic_write(
+            failed_file,
+            f"# Phase 0 FAILED: {issue_key}\n\n"
+            f"**Blocking errors:** {blocking_errors}\n"
+            f"**Non-blocking errors:** {non_blocking_errors}\n\n---\n\n"
+            f"## Raw LLM Response\n\n```xml\n{response.raw_content}\n```\n",
         )
-
-        raw_content = completion.choices[0].message.content or ""
-        tokens_in = completion.usage.prompt_tokens if completion.usage else 0
-        tokens_out = completion.usage.completion_tokens if completion.usage else 0
-        tokens_used = tokens_in + tokens_out
-        finish_reason = completion.choices[0].finish_reason or ""
-
-    except Exception as e:
-        logger.error(f"Phase 0: LLM call failed: {e}")
+        logger.error(
+            f"Phase 0 failed: LLM response missing critical sections. "
+            f"Raw output saved to {failed_file}. Jira was NOT modified."
+        )
         return PhaseZeroResult(
-            response=PhaseZeroResponse(raw_content=""),
+            response=response,
             jira_updated=False,
-            error=f"LLM call failed: {e}",
+            output_file=failed_file,
+            validation_errors=validation_errors,
+            error=(
+                f"Phase 0 failed: LLM response missing critical sections: "
+                f"{blocking_errors}. Jira was NOT modified."
+            ),
         )
 
-    duration_ms = int((time.time() - start_time) * 1000)
-    logger.info(f"Phase 0: LLM response received ({tokens_used} tokens, {duration_ms}ms)")
+    # Non-blocking warnings — proceed with Jira write
+    if non_blocking_errors:
+        logger.warning(f"Phase 0: Non-blocking validation warnings: {non_blocking_errors}")
 
-    # --- Step 4: Parse and validate ---
-    response = parse_phase_zero_response(raw_content)
-    response.model = model
-    response.tokens_used = tokens_used
-    response.tokens_in = tokens_in
-    response.tokens_out = tokens_out
-    response.finish_reason = finish_reason
-
-    validation_errors = validate_phase_zero(response)
-    if validation_errors:
-        logger.warning(f"Phase 0: Validation errors: {validation_errors}")
-    else:
-        logger.info("Phase 0: Validation passed")
-
-    # --- Step 5: Save output file ---
+    # --- Step 5b: Save output file ---
     output_file = save_phase_zero_output(
         issue_key=issue_key,
         response=response,
@@ -835,6 +993,7 @@ def execute_phase_zero(
 # Phase 0.5: Feedback Incorporation
 # =============================================================================
 
+
 def execute_phase_zero_feedback(
     mcp: MCPClientManager,
     llm_client: OpenAI,
@@ -872,6 +1031,7 @@ def execute_phase_zero_feedback(
     from ..prompts.phase_zero_feedback_prompt import (
         PHASE_ZERO_FEEDBACK_SYSTEM_PROMPT,
         build_phase_zero_feedback_prompt,
+        PHASE05_RETRY_PROMPT_TEMPLATE,
     )
 
     logger.info(f"Phase 0.5: Starting feedback incorporation for {issue_key}")
@@ -903,63 +1063,109 @@ def execute_phase_zero_feedback(
     issue_dir = Path(output_dir) / issue_key
     issue_dir.mkdir(parents=True, exist_ok=True)
     prompt_file = issue_dir / f"{issue_key}_phase05_prompt.md"
-    prompt_file.write_text(
+    atomic_write(
+        prompt_file,
         f"# Phase 0.5 Prompt: {issue_key}\n\n"
         f"Generated: {datetime.now().isoformat()}\n"
         f"Model: {model}\n"
         f"Feedback comments: {len(assignee_feedback)}\n\n---\n\n"
         f"## System Prompt\n\n```\n{PHASE_ZERO_FEEDBACK_SYSTEM_PROMPT}\n```\n\n---\n\n"
         f"## User Prompt\n\n{user_prompt}\n",
-        encoding="utf-8",
     )
 
-    # --- Step 3: Call LLM ---
-    logger.info(f"Phase 0.5: Calling LLM ({model})")
-    start_time = time.time()
+    # --- Step 3: Call LLM with validation retry loop ---
+    response = None
+    validation_errors: list[str] = []
+    current_prompt = user_prompt
+    current_system = PHASE_ZERO_FEEDBACK_SYSTEM_PROMPT
 
-    try:
-        completion = llm_client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": PHASE_ZERO_FEEDBACK_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.2,
-            max_tokens=8192,
+    for attempt in range(1, MAX_PHASE0_VALIDATION_RETRIES + 2):
+        logger.info(f"Phase 0.5: Calling LLM ({model}), attempt {attempt}")
+        start_time = time.time()
+
+        try:
+            completion = _call_llm_with_retry(
+                llm_client,
+                messages=[
+                    {"role": "system", "content": current_system},
+                    {"role": "user", "content": current_prompt},
+                ],
+                model=model,
+            )
+
+            raw_content = completion.choices[0].message.content or ""
+            tokens_in = completion.usage.prompt_tokens if completion.usage else 0
+            tokens_out = completion.usage.completion_tokens if completion.usage else 0
+            tokens_used = tokens_in + tokens_out
+            finish_reason = completion.choices[0].finish_reason or ""
+
+        except Exception as e:
+            logger.error(f"Phase 0.5: LLM call failed: {e}")
+            return PhaseZeroResult(
+                response=PhaseZeroResponse(raw_content=""),
+                jira_updated=False,
+                error=f"LLM call failed: {e}",
+            )
+
+        duration_ms = int((time.time() - start_time) * 1000)
+        logger.info(f"Phase 0.5: LLM response received ({tokens_used} tokens, {duration_ms}ms)")
+
+        # --- Step 4: Parse and validate ---
+        response = parse_phase_zero_response(raw_content)
+        response.model = model
+        response.tokens_used = tokens_used
+        response.tokens_in = tokens_in
+        response.tokens_out = tokens_out
+        response.finish_reason = finish_reason
+
+        validation_errors = validate_phase_zero(response)
+        if not validation_errors:
+            logger.info("Phase 0.5: Validation passed")
+            break
+
+        logger.warning(f"Phase 0.5: Validation errors (attempt {attempt}): {validation_errors}")
+
+        if attempt <= MAX_PHASE0_VALIDATION_RETRIES:
+            current_prompt = PHASE05_RETRY_PROMPT_TEMPLATE.format(
+                errors="\n".join(f"- {e}" for e in validation_errors),
+                previous_response=raw_content[:6000],
+            )
+        else:
+            logger.error(
+                f"Phase 0.5: Max validation retries reached. Errors: {validation_errors}"
+            )
+
+    # --- Step 5: Classify errors and gate Jira writes ---
+    blocking_errors, non_blocking_errors = classify_validation_errors(validation_errors)
+
+    if blocking_errors:
+        failed_file = issue_dir / f"{issue_key}_phase05_failed.md"
+        atomic_write(
+            failed_file,
+            f"# Phase 0.5 FAILED: {issue_key}\n\n"
+            f"**Blocking errors:** {blocking_errors}\n"
+            f"**Non-blocking errors:** {non_blocking_errors}\n\n---\n\n"
+            f"## Raw LLM Response\n\n```xml\n{response.raw_content}\n```\n",
         )
-
-        raw_content = completion.choices[0].message.content or ""
-        tokens_in = completion.usage.prompt_tokens if completion.usage else 0
-        tokens_out = completion.usage.completion_tokens if completion.usage else 0
-        tokens_used = tokens_in + tokens_out
-        finish_reason = completion.choices[0].finish_reason or ""
-
-    except Exception as e:
-        logger.error(f"Phase 0.5: LLM call failed: {e}")
+        logger.error(
+            f"Phase 0.5 failed: LLM response missing critical sections. "
+            f"Raw output saved to {failed_file}. Jira was NOT modified."
+        )
         return PhaseZeroResult(
-            response=PhaseZeroResponse(raw_content=""),
+            response=response,
             jira_updated=False,
-            error=f"LLM call failed: {e}",
+            output_file=failed_file,
+            validation_errors=validation_errors,
+            error=(
+                f"Phase 0.5 failed: LLM response missing critical sections: "
+                f"{blocking_errors}. Jira was NOT modified."
+            ),
         )
 
-    duration_ms = int((time.time() - start_time) * 1000)
-    logger.info(f"Phase 0.5: LLM response received ({tokens_used} tokens, {duration_ms}ms)")
+    if non_blocking_errors:
+        logger.warning(f"Phase 0.5: Non-blocking validation warnings: {non_blocking_errors}")
 
-    # --- Step 4: Parse and validate ---
-    response = parse_phase_zero_response(raw_content)
-    response.model = model
-    response.tokens_used = tokens_used
-    response.tokens_in = tokens_in
-    response.tokens_out = tokens_out
-    response.finish_reason = finish_reason
-
-    validation_errors = validate_phase_zero(response)
-    if validation_errors:
-        logger.warning(f"Phase 0.5: Validation errors: {validation_errors}")
-    else:
-        logger.info("Phase 0.5: Validation passed")
-
-    # --- Step 5: Save output file ---
+    # --- Step 5b: Save output file ---
     output_file = _save_phase05_output(
         issue_key=issue_key,
         response=response,
@@ -997,8 +1203,8 @@ def execute_phase_zero_feedback(
     if dor_met:
         logger.info("Phase 0.5: DoR MET — all blocking questions resolved")
         # Transition to AI-TO-DO if not dry-run
-        ai_todo_status = (config or {}).get("jira", {}).get("statuses", {}).get(
-            "ai_to_do", "AI-TO-DO"
+        ai_todo_status = (
+            (config or {}).get("jira", {}).get("statuses", {}).get("ai_to_do", "AI-TO-DO")
         )
         if not dry_run:
             try:
@@ -1038,8 +1244,7 @@ def _save_phase05_output(
     summary = context.jira.summary if context.jira else issue_key
 
     feedback_summary = "\n".join(
-        f"- **{fb['author']}** ({fb['created']}): {fb['body'][:100]}..."
-        for fb in assignee_feedback
+        f"- **{fb['author']}** ({fb['created']}): {fb['body'][:100]}..." for fb in assignee_feedback
     )
 
     content = f"""# Phase 0.5 Analysis: {issue_key}
@@ -1078,7 +1283,7 @@ def _save_phase05_output(
 {response.raw_content}
 ```
 """
-    filepath.write_text(content, encoding="utf-8")
+    atomic_write(filepath, content)
     return filepath
 
 

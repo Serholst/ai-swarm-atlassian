@@ -35,6 +35,9 @@ from .context_builder import (
     find_phase0_questions_timestamp,
     # Stage 4
     build_execution_context,
+    # Stage 3b (GitHub Gate)
+    should_fetch_github_context,
+    extract_github_url_from_comments,
     # Full Pipelines
     build_context_pipeline,
     build_refined_context_pipeline,
@@ -109,6 +112,9 @@ __all__ = [
     "retrieve_confluence_templates",
     # Stage 4
     "build_execution_context",
+    # Stage 3b (GitHub Gate)
+    "should_fetch_github_context",
+    "extract_github_url_from_comments",
     # Full Pipelines
     "build_context_pipeline",
     "build_refined_context_pipeline",

@@ -273,7 +273,11 @@ def handle_post_execution(
                 )
 
                 # Build and post single consolidated ADF comment
-                parent_key = execution_context.jira.parent_key or issue_key
+                parent_key = (
+                    execution_context.jira.parent_key
+                    if execution_context.jira
+                    else None
+                ) or issue_key
                 adf_comment = build_consolidated_adf_comment(
                     result=decomposition_result,
                     parent_key=parent_key,
@@ -290,7 +294,11 @@ def handle_post_execution(
                 )
         else:
             # Non-SUCCESS: post failure comment as Markdown
-            jira_summary = execution_context.jira.summary if execution_context else None
+            jira_summary = (
+                execution_context.jira.summary
+                if execution_context and execution_context.jira
+                else None
+            )
             comment = build_failure_comment(issue_key, outcome, issues, jira_summary)
             mcp.jira_add_comment(issue_key, comment)
             logger.info(f"Added failure comment to {issue_key}")

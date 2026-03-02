@@ -47,6 +47,7 @@ from executor.phases import (
     execute_phase_zero,
 )
 from executor.phases.context_store import save_context, load_context
+from executor.utils.issue_lock import acquire_issue_lock, IssueLockError
 from openai import OpenAI
 
 console = Console()
@@ -280,8 +281,20 @@ def execute_pipeline(
             else:
                 return 0
 
-        # For non-Backlog, non-AI-TO-DO statuses → run checklist instead of full pipeline
+        # For non-Backlog, non-AI-TO-DO statuses → route appropriately
         if status_lower not in ("ai to do", "ai-to-do", "ai todo"):
+            if status_lower == "human plan review":
+                console.print(
+                    "  [cyan]\u2192[/cyan] Routing to Plan Review handler"
+                )
+                console.print("")
+                return human_plan_review_handler(
+                    mcp=mcp,
+                    issue_key=issue_key,
+                    config=config.model_dump(),
+                    output_dir=output_dir,
+                )
+
             from executor.phases.status_checker import run_status_check
             return run_status_check(
                 mcp=mcp,
@@ -326,19 +339,28 @@ def execute_pipeline(
                     f" -- will create missing artifacts[/dim]"
                 )
 
-            console.print(
-                "[dim]  (use --force to re-run the full pipeline)[/dim]"
-            )
-            return run_status_check(
-                mcp=mcp,
-                issue_key=issue_key,
-                issue_status=issue_status,
-                config=config.model_dump(),
-                console=console,
-                llm_client=deepseek_client,
-                output_dir=output_dir,
-                dry_run=dry_run,
-            )
+            # AI-TO-DO → always fall through to Stages 2-5
+            if status_lower in ("ai to do", "ai-to-do", "ai todo"):
+                if all_fulfilled:
+                    console.print(
+                        "[bold yellow]Artifacts from a previous run found — "
+                        "they will be overwritten by the new pipeline run[/bold yellow]"
+                    )
+                # Fall through to Stages 2-5 regardless of all_fulfilled
+            else:
+                console.print(
+                    "[dim]  (use --force to re-run the full pipeline)[/dim]"
+                )
+                return run_status_check(
+                    mcp=mcp,
+                    issue_key=issue_key,
+                    issue_status=issue_status,
+                    config=config.model_dump(),
+                    console=console,
+                    llm_client=deepseek_client,
+                    output_dir=output_dir,
+                    dry_run=dry_run,
+                )
 
         # =================================================================
         # Stages 2-4: Context Building
@@ -668,16 +690,27 @@ def execute_pipeline(
         mcp.stop_all()
 
 
-def create_stories_pipeline(task_input: str, output_dir: str = "outputs") -> int:
+def human_plan_review_handler(
+    mcp: MCPClientManager,
+    issue_key: str,
+    config: dict,
+    output_dir: str = "outputs",
+) -> int:
     """
-    Create Jira Stories from approved decomposition.
+    Handle --task on an issue in "Human Plan Review" status.
+
+    1. Check if [PLAN REVIEW] task is Done
+    2. If not Done -> inform user, return 0
+    3. If Done -> create stories -> transition to "Ready for Dev"
 
     Args:
-        task_input: Jira issue key or URL
-        output_dir: Output directory (unused, for consistency)
+        mcp: MCP client manager
+        issue_key: Jira issue key
+        config: SDLC config dict
+        output_dir: Output directory for manifest file
 
     Returns:
-        Exit code (0 = success, 1 = error)
+        Exit code: 0 = success or waiting, 1 = error, 2 = partial story creation
     """
     from executor.phases.story_creator import (
         check_review_approved,
@@ -687,115 +720,152 @@ def create_stories_pipeline(task_input: str, output_dir: str = "outputs") -> int
         create_dependency_links,
     )
 
-    issue_key = parse_issue_key(task_input)
     project_key = extract_project_key(issue_key)
 
-    console.print(Panel.fit(
-        f"[bold cyan]AI-SWARM Story Creator[/bold cyan]\n"
-        f"Feature: {issue_key}",
-        border_style="cyan",
-    ))
+    # Step 1: Check [PLAN REVIEW] status
+    console.print("[bold]Step 1: Checking review approval[/bold]")
+    approved, review_key = check_review_approved(mcp, issue_key)
 
-    # Load environment and config
-    env_vars = load_environment()
-    config_path = Path(__file__).parent / "config" / "sdlc_config.yaml"
-    config = load_config(config_path)
-
-    mcp = MCPClientManager()
-
-    try:
-        console.print("\n  Starting MCP servers...")
-        mcp.start_all(env_vars)
-        console.print("  [green]✓[/green] MCP servers started")
-
-        # Step 1: Check review approval
-        console.print("\n[bold]Step 1: Checking review approval[/bold]")
-        approved, review_key = check_review_approved(mcp, issue_key)
-
-        if review_key:
-            console.print(f"  Found PLAN REVIEW task: {review_key}")
-        else:
-            console.print("  [red]✗ No PLAN REVIEW task found[/red]")
-            console.print("  Run the full pipeline first: python3 execute.py --task " + issue_key)
-            return 1
-
-        if not approved:
-            console.print(f"  [red]✗ PLAN REVIEW task {review_key} is not Done[/red]")
-            console.print("  Approve the PLAN REVIEW task before creating stories.")
-            return 1
-
-        console.print(f"  [green]✓[/green] PLAN REVIEW task {review_key} is approved")
-
-        # Step 1.5: Ensure blocking link (Review blocks Feature)
-        console.print("\n[bold]Step 1.5: Ensuring blocking link[/bold]")
-        if ensure_review_blocking_link(mcp, review_key, issue_key, config.model_dump()):
-            console.print(
-                f"  [green]✓[/green] {issue_key} is blocked by {review_key}"
-            )
-        else:
-            console.print(
-                f"  [yellow]⚠[/yellow] Could not ensure blocking link "
-                f"({review_key} blocks {issue_key})"
-            )
-
-        # Step 2: Extract stories from comment
-        console.print("\n[bold]Step 2: Extracting stories from decomposition[/bold]")
-        stories = extract_stories_from_comment(mcp, issue_key)
-
-        if not stories:
-            console.print("  [red]✗ No stories found in decomposition comment[/red]")
-            return 1
-
-        console.print(f"  [green]✓[/green] Found {len(stories)} stories")
-        for story in stories:
-            console.print(f"    {story.order}. [{story.layer}] {story.title}")
-
-        # Step 3: Create Jira stories
-        console.print(f"\n[bold]Step 3: Creating Jira Stories in {project_key}[/bold]")
-        created = create_jira_stories(
-            mcp=mcp,
-            parent_key=issue_key,
-            project_key=project_key,
-            stories=stories,
-            config=config.model_dump(),
+    if review_key is None:
+        console.print(f"[red]\u2717 No [PLAN REVIEW] task found for {issue_key}.[/red]")
+        console.print(f"   This may indicate the pipeline didn't complete properly.")
+        console.print(
+            f"   Consider re-running: python execute.py --task {issue_key} --force"
         )
-
-        # Step 4: Create dependency links
-        has_deps = any(story.depends_on for story, _ in created)
-        if has_deps:
-            console.print(f"\n[bold]Step 4: Creating dependency links[/bold]")
-            dep_count = create_dependency_links(mcp, created, config.model_dump())
-            console.print(f"  [green]✓[/green] Created {dep_count} dependency links")
-
-        # Report results
-        console.print(f"\n[bold]Results:[/bold]")
-        for story, key in created:
-            deps_str = ""
-            if story.depends_on:
-                dep_keys = []
-                order_to_key = {s.order: k for s, k in created}
-                for d in story.depends_on:
-                    dk = order_to_key.get(d, f"Step {d}")
-                    dep_keys.append(dk)
-                deps_str = f" (blocked by: {', '.join(dep_keys)})"
-            console.print(f"  [green]✓[/green] {key}: [{story.layer}] {story.title}{deps_str}")
-
-        failed = len(stories) - len(created)
-        if failed > 0:
-            console.print(f"  [yellow]⚠[/yellow] {failed} stories failed to create")
-
-        console.print(f"\n[bold green]✓ Created {len(created)}/{len(stories)} stories[/bold green]")
-        return 0
-
-    except Exception as e:
-        console.print(f"\n[bold red]✗ Error: {e}[/bold red]")
-        import traceback
-        traceback.print_exc()
         return 1
 
-    finally:
-        console.print("\n[dim]Stopping MCP servers...[/dim]")
-        mcp.stop_all()
+    if not approved:
+        console.print(
+            f"[yellow]\u23f3 [PLAN REVIEW] for {issue_key} is not yet Done.[/yellow]"
+        )
+        console.print(f"   Review task: {review_key}")
+        console.print(
+            f"   Waiting for human approval. Re-run --task after review is complete."
+        )
+        return 0
+
+    console.print(f"  [green]\u2713[/green] PLAN REVIEW task {review_key} is approved")
+
+    # Ensure blocking link (Review blocks Feature)
+    if ensure_review_blocking_link(mcp, review_key, issue_key, config):
+        console.print(
+            f"  [green]\u2713[/green] {issue_key} is blocked by {review_key}"
+        )
+
+    # Step 2: Extract and create stories
+    console.print("\n[bold]Step 2: Extracting stories from decomposition[/bold]")
+    stories = extract_stories_from_comment(mcp, issue_key)
+
+    if not stories:
+        console.print("  [red]\u2717 No stories found in decomposition comment[/red]")
+        return 1
+
+    console.print(f"  [green]\u2713[/green] Found {len(stories)} stories")
+    for story in stories:
+        console.print(f"    {story.order}. [{story.layer}] {story.title}")
+
+    console.print(f"\n[bold]Step 3: Creating Jira Stories in {project_key}[/bold]")
+    report = create_jira_stories(
+        mcp=mcp,
+        parent_key=issue_key,
+        project_key=project_key,
+        stories=stories,
+        config=config,
+        output_dir=output_dir,
+    )
+
+    # Create dependency links for created + skipped stories
+    all_existing = report.created_or_skipped
+    has_deps = any(story.depends_on for story, _ in all_existing)
+    if has_deps:
+        console.print("\n[bold]Step 3.1: Creating dependency links[/bold]")
+        dep_count = create_dependency_links(mcp, all_existing, config)
+        console.print(f"  [green]\u2713[/green] Created {dep_count} dependency links")
+
+    # Report results
+    console.print(f"\n[bold]Results:[/bold]")
+    for outcome in report.outcomes:
+        key = outcome.jira_key or "N/A"
+        layer = outcome.story.layer
+        title = outcome.story.title
+
+        if outcome.status == "created":
+            deps_str = ""
+            if outcome.story.depends_on:
+                order_to_key = {s.order: k for s, k in all_existing}
+                dep_keys = [
+                    order_to_key.get(d, f"Step {d}") for d in outcome.story.depends_on
+                ]
+                deps_str = f" (blocked by: {', '.join(dep_keys)})"
+            console.print(f"  [green]\u2713[/green] {key}: [{layer}] {title}{deps_str}")
+        elif outcome.status == "skipped":
+            console.print(f"  [dim]\u21a9 {key}: [{layer}] {title} (already exists)[/dim]")
+        else:
+            console.print(f"  [red]\u2717[/red] [{layer}] {title}: {outcome.error}")
+
+    # Evaluate results and determine exit code
+    n_created = len(report.created)
+    n_skipped = len(report.skipped)
+    n_failed = len(report.failed)
+    total = len(stories)
+
+    if n_failed == total:
+        console.print(f"\n[bold red]\u2717 All {n_failed} stories failed to create[/bold red]")
+        return 1
+
+    if n_failed > 0:
+        console.print(
+            f"\n[bold yellow]\u26a0 Partial success: {n_created} created, "
+            f"{n_skipped} skipped, {n_failed} failed.[/bold yellow]"
+        )
+        console.print(
+            f"  Re-run `--task {issue_key}` to retry failed stories."
+        )
+        return 2  # Partial — do NOT transition
+
+    # All created or skipped — proceed to transition
+    if n_skipped > 0:
+        console.print(
+            f"\n[bold green]\u2713 {n_created} created, {n_skipped} skipped "
+            f"(already existed) \u2014 {total} total[/bold green]"
+        )
+    else:
+        console.print(f"\n[bold green]\u2713 Created {n_created}/{total} stories[/bold green]")
+
+    # Step 4: Transition to "Ready for Dev"
+    target_status = config.get("jira", {}).get("statuses", {}).get(
+        "ready_for_dev", "Ready for Dev"
+    )
+    console.print(f"\n[bold]Step 4: Transitioning to {target_status}[/bold]")
+
+    try:
+        mcp.jira_transition_issue(issue_key, target_status)
+    except Exception as e:
+        logger.error(f"Transition to '{target_status}' failed: {e}")
+        console.print(f"  [red]\u2717 Transition failed: {e}[/red]")
+        return 1
+
+    # Post-transition verification
+    try:
+        current = get_issue_status(mcp, issue_key)
+        if current.lower() != target_status.lower():
+            logger.error(
+                f"Transition verification failed: expected '{target_status}', got '{current}'"
+            )
+            console.print(
+                f"  [red]\u2717 Verification failed: expected '{target_status}', "
+                f"got '{current}'[/red]"
+            )
+            return 1
+    except Exception as e:
+        logger.warning(f"Could not verify transition: {e}")
+
+    console.print(f"  [green]\u2713[/green] {issue_key} \u2192 {target_status}")
+    return 0
+
+
+
+
 
 
 def refinement_pipeline(
@@ -1104,7 +1174,6 @@ Examples:
   python3 execute.py --task PROJ-123               # Full pipeline (Stages 1-5)
   python3 execute.py --task PROJ-123 --dry-run
   python3 execute.py --task PROJ-123 --json-logs
-  python3 execute.py --create-stories PROJ-123
   python3 execute.py --refine PROJ-123 --feedback "Split step 3 into BE and FE"
   python3 execute.py -t PROJ-123 -o ./my_outputs
 
@@ -1123,12 +1192,6 @@ Stages:
     parser.add_argument(
         "--task", "-t",
         help="Jira issue key or URL (for full pipeline)"
-    )
-
-    parser.add_argument(
-        "--create-stories",
-        metavar="ISSUE_KEY",
-        help="Create Jira Stories from approved decomposition"
     )
 
     parser.add_argument(
@@ -1181,24 +1244,16 @@ Stages:
     # Dispatch to appropriate pipeline
     if args.phase0:
         try:
-            return phase_zero_pipeline(
-                task_input=args.phase0,
-                dry_run=args.dry_run,
-                output_dir=args.output_dir,
-            )
-        except ValueError as e:
+            issue_key = parse_issue_key(args.phase0)
+            with acquire_issue_lock(issue_key):
+                return phase_zero_pipeline(
+                    task_input=args.phase0,
+                    dry_run=args.dry_run,
+                    output_dir=args.output_dir,
+                )
+        except IssueLockError as e:
             console.print(f"[red]Error: {e}[/red]")
             return 1
-        except KeyboardInterrupt:
-            console.print("\n[yellow]Cancelled by user[/yellow]")
-            return 130
-
-    if args.create_stories:
-        try:
-            return create_stories_pipeline(
-                task_input=args.create_stories,
-                output_dir=args.output_dir,
-            )
         except ValueError as e:
             console.print(f"[red]Error: {e}[/red]")
             return 1
@@ -1210,12 +1265,17 @@ Stages:
         if not args.feedback:
             parser.error("--feedback is required with --refine")
         try:
-            return refinement_pipeline(
-                task_input=args.refine,
-                feedback=args.feedback,
-                output_dir=args.output_dir,
-                json_logs=args.json_logs,
-            )
+            issue_key = parse_issue_key(args.refine)
+            with acquire_issue_lock(issue_key):
+                return refinement_pipeline(
+                    task_input=args.refine,
+                    feedback=args.feedback,
+                    output_dir=args.output_dir,
+                    json_logs=args.json_logs,
+                )
+        except IssueLockError as e:
+            console.print(f"[red]Error: {e}[/red]")
+            return 1
         except ValueError as e:
             console.print(f"[red]Error: {e}[/red]")
             return 1
@@ -1224,17 +1284,22 @@ Stages:
             return 130
 
     if not args.task:
-        parser.error("--task is required (or use --phase0 / --create-stories / --refine)")
+        parser.error("--task is required (or use --phase0 / --refine)")
 
     try:
-        return execute_pipeline(
-            task_input=args.task,
-            dry_run=args.dry_run,
-            output_dir=args.output_dir,
-            json_logs=args.json_logs,
-            force=args.force,
-        )
+        issue_key = parse_issue_key(args.task)
+        with acquire_issue_lock(issue_key):
+            return execute_pipeline(
+                task_input=args.task,
+                dry_run=args.dry_run,
+                output_dir=args.output_dir,
+                json_logs=args.json_logs,
+                force=args.force,
+            )
 
+    except IssueLockError as e:
+        console.print(f"[red]Error: {e}[/red]")
+        return 1
     except ValueError as e:
         console.print(f"[red]Error: {e}[/red]")
         return 1

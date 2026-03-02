@@ -24,6 +24,7 @@ from ..models.execution_context import ExecutionContext
 from ..models.llm_metrics import LLMCallMetrics, ExecutionMetrics
 from ..prompts import SYSTEM_PROMPT, build_user_prompt, build_refinement_prompt
 from ..prompts.constants import LAYER_CODES_BLOCK
+from ..utils.file_utils import atomic_write
 from .validation import (
     validate_work_plan,
     validate_response_sections,
@@ -357,13 +358,13 @@ class LLMExecutor:
         # Save prompt
         version_suffix = f"_v{version}"
         prompt_file = issue_dir / f"{issue_key}_prompt{version_suffix}.md"
-        prompt_file.write_text(
+        atomic_write(
+            prompt_file,
             f"# Refinement Prompt v{version} for {issue_key}\n\n"
             f"Generated: {datetime.now().isoformat()}\n"
             f"Model: {self.model}\n\n---\n\n"
             f"## System Prompt\n\n```\n{SYSTEM_PROMPT}\n```\n\n---\n\n"
             f"## User Prompt\n\n{user_prompt}\n",
-            encoding="utf-8",
         )
 
         # Call LLM with same validation loop as execute()
@@ -461,31 +462,31 @@ class LLMExecutor:
 
         # Save outputs with version suffix
         reasoning_file = issue_dir / f"{issue_key}_reasoning{version_suffix}.md"
-        reasoning_file.write_text(
+        atomic_write(
+            reasoning_file,
             f"# Refined Reasoning v{version} for {issue_key}\n\n"
             f"Generated: {datetime.now().isoformat()}\n"
             f"Model: {response.model}\n"
             f"Tokens Used: {response.tokens_used}\n\n---\n\n"
             f"{response.raw_content}\n",
-            encoding="utf-8",
         )
 
         plan_file = issue_dir / f"{issue_key}_plan{version_suffix}.md"
         summary = context.jira.summary if context.jira else issue_key
-        plan_file.write_text(
+        atomic_write(
+            plan_file,
             f"# Refined Work Plan v{version}: {issue_key}\n\n"
             f"**Task:** {summary}\n"
             f"**Generated:** {datetime.now().isoformat()}\n"
             f"**Model:** {response.model}\n"
             f"**Feedback:** {feedback[:200]}\n\n---\n\n"
             f"## Steps\n\n{response.work_plan or '[Section not found]'}\n",
-            encoding="utf-8",
         )
 
         metrics_file = issue_dir / f"{issue_key}_metrics{version_suffix}.md"
-        metrics_file.write_text(
+        atomic_write(
+            metrics_file,
             self.metrics.to_markdown() if self.metrics else "No metrics collected.",
-            encoding="utf-8",
         )
 
         # Context file not re-saved (same as original)
@@ -502,18 +503,63 @@ class LLMExecutor:
         logger.info(f"Refinement v{version} complete: {issue_key}")
         return response, output
 
+    # Transient HTTP status codes that warrant an API-level retry
+    TRANSIENT_API_ERRORS = {429, 502, 503, 504}
+    MAX_API_RETRIES = 3
+    BACKOFF_BASE_SECONDS = 2
+
+    def _call_api_with_retry(self, messages: list[dict], **kwargs: object) -> object:
+        """
+        Wrapper around ``client.chat.completions.create`` with exponential
+        backoff for transient API errors (429 / 502 / 503 / 504).
+
+        All keyword arguments are forwarded to the OpenAI create call.
+        """
+        max_retries = self.MAX_API_RETRIES
+        base_backoff = self.BACKOFF_BASE_SECONDS
+
+        for api_attempt in range(1, max_retries + 1):
+            try:
+                return self.client.chat.completions.create(
+                    messages=messages, **kwargs
+                )
+            except Exception as e:
+                status_code = getattr(e, "status_code", None)
+                if status_code in self.TRANSIENT_API_ERRORS and api_attempt < max_retries:
+                    wait = base_backoff * (2 ** (api_attempt - 1))
+                    logger.warning(
+                        f"DeepSeek API error {status_code}, "
+                        f"retry {api_attempt}/{max_retries} in {wait}s"
+                    )
+                    time.sleep(wait)
+                    continue
+                # Non-transient or final attempt — propagate
+                logger.error(
+                    f"DeepSeek API unavailable after {api_attempt} attempt(s) "
+                    f"(last error: {e}). "
+                    f"Context was saved — you can retry with: "
+                    f"python execute.py --refine <ISSUE_KEY>"
+                )
+                raise
+
+        # Should not be reached, but satisfy type checkers
+        raise RuntimeError(f"Max API retries ({max_retries}) exhausted")  # pragma: no cover
+
     def _call_llm(self, user_prompt: str) -> LLMResponse:
         """Call DeepSeek API and return parsed response."""
         try:
-            completion = self.client.chat.completions.create(
-                model=self.model,
+            completion = self._call_api_with_retry(
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user_prompt},
                 ],
+                model=self.model,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
             )
+
+            if not completion.choices:
+                raise RuntimeError("LLM API returned empty choices array")
 
             raw_content = completion.choices[0].message.content or ""
             tokens_in = completion.usage.prompt_tokens if completion.usage else 0
@@ -566,8 +612,7 @@ class LLMExecutor:
         )
 
         try:
-            completion = self.client.chat.completions.create(
-                model=self.model,
+            completion = self._call_api_with_retry(
                 messages=[
                     {
                         "role": "system",
@@ -576,9 +621,13 @@ class LLMExecutor:
                     },
                     {"role": "user", "content": retry_prompt},
                 ],
+                model=self.model,
                 temperature=0.1,  # Lower temperature for deterministic fix
                 max_tokens=4096,  # Less tokens needed for just one section
             )
+
+            if not completion.choices:
+                raise RuntimeError("LLM API returned empty choices array on validation retry")
 
             fixed_work_plan = completion.choices[0].message.content or ""
             tokens_in = completion.usage.prompt_tokens if completion.usage else 0
@@ -639,7 +688,7 @@ Generated: {context.timestamp.isoformat()}
 
 {context.build_prompt_context()}
 """
-        filepath.write_text(content, encoding="utf-8")
+        atomic_write(filepath, content)
         return filepath
 
     def _save_prompt(self, issue_dir: Path, context: ExecutionContext, user_prompt: str) -> Path:
@@ -667,7 +716,7 @@ Max Tokens: {self.max_tokens}
 
 {user_prompt}
 """
-        filepath.write_text(content, encoding="utf-8")
+        atomic_write(filepath, content)
         return filepath
 
     def _save_reasoning(self, issue_dir: Path, context: ExecutionContext, response: LLMResponse) -> Path:
@@ -685,7 +734,7 @@ Finish Reason: {response.finish_reason}
 
 {response.raw_content}
 """
-        filepath.write_text(content, encoding="utf-8")
+        atomic_write(filepath, content)
         return filepath
 
     def _save_plan(self, issue_dir: Path, context: ExecutionContext, response: LLMResponse) -> Path:
@@ -731,7 +780,7 @@ Finish Reason: {response.finish_reason}
 
 {response.definition_of_ready or '[Section not found in response]'}
 """
-        filepath.write_text(content, encoding="utf-8")
+        atomic_write(filepath, content)
         return filepath
 
     def _save_metrics(self, issue_dir: Path, context: ExecutionContext) -> Path:
@@ -743,7 +792,7 @@ Finish Reason: {response.finish_reason}
         else:
             content = f"# LLM Metrics: {context.issue_key}\n\nNo metrics collected."
 
-        filepath.write_text(content, encoding="utf-8")
+        atomic_write(filepath, content)
         return filepath
 
     def _save_selection(self, issue_dir: Path, context: ExecutionContext) -> Optional[Path]:
@@ -764,7 +813,7 @@ Finish Reason: {response.finish_reason}
 
 {selection_log.format_markdown()}
 """
-        filepath.write_text(content, encoding="utf-8")
+        atomic_write(filepath, content)
         return filepath
 
 

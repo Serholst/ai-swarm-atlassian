@@ -36,15 +36,15 @@ class CheckItem:
 
 # Ordered titles of the 4 expand blocks written by build_consolidated_adf_comment()
 COMMENT_BLOCKS: list[str] = [
-    "Context Summary",
-    "Technical Decomposition",
-    "Executor Rationale",
-    "Clarification Questions",   # optional — only present when there are questions
+    "## Context Summary",
+    "## Technical Decomposition",
+    "## Executor Rationale",
+    "## Clarification Questions",   # optional — only present when there are questions
 ]
 REQUIRED_BLOCKS: frozenset[str] = frozenset({
-    "Context Summary",
-    "Technical Decomposition",
-    "Executor Rationale",
+    "## Context Summary",
+    "## Technical Decomposition",
+    "## Executor Rationale",
 })
 _MIN_BLOCK_CHARS = 30  # anything shorter is treated as empty / not populated
 
@@ -103,7 +103,7 @@ def _parse_comment_blocks(comments_text: str) -> dict[str, str]:
     """
     Extract the content of each expand block from the rendered ADF comment text.
 
-    ADF expand nodes render as:  "{title}\\n{content}\\n"
+    ADF expand nodes render as:  "## {title}\\n{content}\\n"
     (see jira_server.py extract_adf_text, node_type == "expand")
 
     Returns dict of {block_title: content_str} for every block found.
@@ -279,7 +279,7 @@ def check_human_plan_review(
     blocks = _parse_comment_blocks(comments_text)
 
     missing_required = [
-        b for b in ["Context Summary", "Technical Decomposition", "Executor Rationale"]
+        b for b in ["## Context Summary", "## Technical Decomposition", "## Executor Rationale"]
         if b not in blocks or len(blocks.get(b, "")) < _MIN_BLOCK_CHARS
     ]
 
@@ -396,7 +396,7 @@ def check_ready_for_dev_promotion(
         ))
 
     # ── 5. No unresolved BLOCKING questions ──────────────────────────────────
-    clarification = blocks.get("Clarification Questions", "")
+    clarification = blocks.get("## Clarification Questions", "")
     has_blocking = bool(re.search(r"BLOCKING", clarification, re.IGNORECASE)) if clarification else False
     results.append(CheckItem(
         "No unresolved BLOCKING questions",
@@ -443,18 +443,19 @@ def check_ready_for_dev_promotion(
             f"already exist: {', '.join(existing_child_stories)} (skipping creation)",
         ))
     elif stories and not dry_run:
-        created_stories = create_jira_stories(
+        report = create_jira_stories(
             mcp=mcp,
             parent_key=issue_key,
             project_key=project_key,
             stories=stories,
             config=config,
         )
-        dep_count = create_dependency_links(mcp, created_stories, config)
+        all_existing = report.created_or_skipped
+        dep_count = create_dependency_links(mcp, all_existing, config)
         results.append(CheckItem(
             "Child stories created",
-            len(created_stories) == len(stories),
-            f"created {len(created_stories)}/{len(stories)} stories, {dep_count} dep links",
+            not report.failed,
+            f"created {len(report.created)}/{len(stories)} stories, {dep_count} dep links",
         ))
     elif dry_run:
         results.append(CheckItem(

@@ -32,6 +32,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from executor.mcp.client import MCPClientManager
+from executor.constants import extract_project_key
 from executor.utils.config_loader import load_config
 from executor.utils.structured_logging import setup_structured_logging
 from executor.models.llm_metrics import PipelineMetrics, StageMetrics
@@ -113,6 +114,7 @@ def execute_pipeline(
     dry_run: bool = False,
     output_dir: str = "outputs",
     json_logs: bool = False,
+    force: bool = False,
 ) -> int:
     """
     Execute the full 5-stage pipeline.
@@ -122,6 +124,7 @@ def execute_pipeline(
         dry_run: If True, skip LLM execution (Stages 1-4 only)
         output_dir: Directory for output files
         json_logs: If True, use JSON structured logging
+        force: If True, bypass pre-flight artifact check
 
     Returns:
         Exit code (0 = success, 1 = error)
@@ -171,6 +174,17 @@ def execute_pipeline(
         console.print("  Starting MCP servers...")
         mcp.start_all(env_vars)
         console.print("  [green]✓[/green] MCP servers started")
+
+        # Enrich config with link types from Confluence SDLC page
+        from executor.constants import fetch_link_types_from_confluence
+
+        link_overrides = fetch_link_types_from_confluence(mcp, config.model_dump())
+        if link_overrides:
+            config.jira.update(link_overrides)
+            console.print(
+                "  [green]✓[/green] Link types loaded from Confluence: "
+                + ", ".join(f"{k}={v}" for k, v in link_overrides.items())
+            )
 
         # =================================================================
         # Stage 1.5: Auto-detect issue status and route to correct phase
@@ -251,13 +265,79 @@ def execute_pipeline(
                 console.print("=" * 70)
 
             console.print("\n[bold green]✓ Phase 0 completed successfully[/bold green]")
-            return 0
 
-        # For non-Backlog statuses, continue with the existing pipeline
+            if result.dor_met and not dry_run:
+                # DoR met → issue transitioned to AI-TO-DO
+                # No artifacts exist yet → must run full pipeline (Stages 2-5)
+                console.print(
+                    "\n[bold cyan]→ DoR met — running full pipeline"
+                    " to create AI-TO-DO artifacts[/bold cyan]"
+                )
+                issue_status = "AI-TO-DO"
+                status_lower = "ai-to-do"
+                force = True  # bypass pre-flight — nothing exists yet
+                # Fall through to Stages 2-5 below
+            else:
+                return 0
+
+        # For non-Backlog, non-AI-TO-DO statuses → run checklist instead of full pipeline
         if status_lower not in ("ai to do", "ai-to-do", "ai todo"):
+            from executor.phases.status_checker import run_status_check
+            return run_status_check(
+                mcp=mcp,
+                issue_key=issue_key,
+                issue_status=issue_status,
+                config=config.model_dump(),
+                console=console,
+                llm_client=deepseek_client,
+                output_dir=output_dir,
+                dry_run=dry_run,
+            )
+
+        # =================================================================
+        # Pre-flight: check artifacts for current status, create missing
+        # =================================================================
+        if not force and not dry_run:
+            from executor.phases.status_checker import (
+                preflight_check,
+                _render_checklist_table,
+                run_status_check,
+            )
+
+            console.print("\n[bold]Pre-flight: Checking artifacts for status"
+                          f" '{issue_status}'[/bold]")
+            preflight_items = preflight_check(
+                mcp=mcp,
+                issue_key=issue_key,
+                issue_status=issue_status,
+            )
+
+            _render_checklist_table(console, preflight_items)
+            all_fulfilled = all(item.passed for item in preflight_items)
+
+            if all_fulfilled:
+                console.print(
+                    "\n[bold cyan]All artifacts present[/bold cyan]"
+                )
+            else:
+                missing = [i.name for i in preflight_items if not i.passed]
+                console.print(
+                    f"\n[dim]Missing: {', '.join(missing)}"
+                    f" -- will create missing artifacts[/dim]"
+                )
+
             console.print(
-                f"  [yellow]⚠[/yellow] Issue is in '{issue_status}' — "
-                f"expected 'Backlog' or 'AI To Do'. Proceeding with full pipeline."
+                "[dim]  (use --force to re-run the full pipeline)[/dim]"
+            )
+            return run_status_check(
+                mcp=mcp,
+                issue_key=issue_key,
+                issue_status=issue_status,
+                config=config.model_dump(),
+                console=console,
+                llm_client=deepseek_client,
+                output_dir=output_dir,
+                dry_run=dry_run,
             )
 
         # =================================================================
@@ -524,9 +604,9 @@ def execute_pipeline(
                 if dr.low_confidence_stories:
                     console.print(f"  [yellow]⚠[/yellow] {len(dr.low_confidence_stories)} stories below confidence threshold")
                 if dr.review_task_key:
-                    console.print(f"  [green]✓[/green] Created review task: {dr.review_task_key}")
+                    console.print(f"  [green]✓[/green] Created PLAN REVIEW task: {dr.review_task_key}")
                 else:
-                    console.print(f"  [yellow]⚠[/yellow] Review task creation failed")
+                    console.print(f"  [yellow]⚠[/yellow] PLAN REVIEW task creation failed")
                 if dr.has_questions():
                     console.print(f"  [yellow]![/yellow] {len(dr.questions)} clarifications needed")
                 console.print(f"  [green]✓[/green] Added decomposition comments")
@@ -601,13 +681,14 @@ def create_stories_pipeline(task_input: str, output_dir: str = "outputs") -> int
     """
     from executor.phases.story_creator import (
         check_review_approved,
+        ensure_review_blocking_link,
         extract_stories_from_comment,
         create_jira_stories,
         create_dependency_links,
     )
 
     issue_key = parse_issue_key(task_input)
-    project_key = issue_key.split("-")[0]
+    project_key = extract_project_key(issue_key)
 
     console.print(Panel.fit(
         f"[bold cyan]AI-SWARM Story Creator[/bold cyan]\n"
@@ -632,18 +713,30 @@ def create_stories_pipeline(task_input: str, output_dir: str = "outputs") -> int
         approved, review_key = check_review_approved(mcp, issue_key)
 
         if review_key:
-            console.print(f"  Found review task: {review_key}")
+            console.print(f"  Found PLAN REVIEW task: {review_key}")
         else:
-            console.print("  [red]✗ No review task found[/red]")
+            console.print("  [red]✗ No PLAN REVIEW task found[/red]")
             console.print("  Run the full pipeline first: python3 execute.py --task " + issue_key)
             return 1
 
         if not approved:
-            console.print(f"  [red]✗ Review task {review_key} is not Done[/red]")
-            console.print("  Approve the review task before creating stories.")
+            console.print(f"  [red]✗ PLAN REVIEW task {review_key} is not Done[/red]")
+            console.print("  Approve the PLAN REVIEW task before creating stories.")
             return 1
 
-        console.print(f"  [green]✓[/green] Review task {review_key} is approved")
+        console.print(f"  [green]✓[/green] PLAN REVIEW task {review_key} is approved")
+
+        # Step 1.5: Ensure blocking link (Review blocks Feature)
+        console.print("\n[bold]Step 1.5: Ensuring blocking link[/bold]")
+        if ensure_review_blocking_link(mcp, review_key, issue_key, config.model_dump()):
+            console.print(
+                f"  [green]✓[/green] {issue_key} is blocked by {review_key}"
+            )
+        else:
+            console.print(
+                f"  [yellow]⚠[/yellow] Could not ensure blocking link "
+                f"({review_key} blocks {issue_key})"
+            )
 
         # Step 2: Extract stories from comment
         console.print("\n[bold]Step 2: Extracting stories from decomposition[/bold]")
@@ -844,7 +937,7 @@ def refinement_pipeline(
             dr = result.decomposition_result
             console.print(f"  [green]✓[/green] Parsed {len(dr.stories)} stories (Refined Plan v{version})")
             if dr.review_task_key:
-                console.print(f"  [green]✓[/green] Updated review task: {dr.review_task_key}")
+                console.print(f"  [green]✓[/green] Updated PLAN REVIEW task: {dr.review_task_key}")
 
         if result.error:
             console.print(f"  [yellow]⚠[/yellow] Transition: {result.error}")
@@ -1073,6 +1166,12 @@ Stages:
         help="Use JSON structured logging (for CI/automation)"
     )
 
+    parser.add_argument(
+        "--force", "-f",
+        action="store_true",
+        help="Force full pipeline re-execution, bypassing pre-flight artifact check"
+    )
+
     args = parser.parse_args()
 
     # Configure structured logging if requested
@@ -1133,6 +1232,7 @@ Stages:
             dry_run=args.dry_run,
             output_dir=args.output_dir,
             json_logs=args.json_logs,
+            force=args.force,
         )
 
     except ValueError as e:

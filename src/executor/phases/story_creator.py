@@ -4,7 +4,7 @@ Story Creator — creates Jira Story issues from approved decomposition.
 Used via CLI: python3 execute.py --create-stories PROJ-123
 
 Workflow:
-1. Check that [REVIEW] task is marked Done
+1. Check that [PLAN REVIEW] task is marked Done
 2. Re-extract stories from Technical Decomposition comment
 3. Create Jira Story issues linked to parent Feature
 """
@@ -13,17 +13,56 @@ import re
 import logging
 from typing import Optional
 
+from ..constants import extract_project_key, get_blocking_link_type
 from ..mcp.client import MCPClientManager
 from ..models.decomposition import DecomposedStory
 
 logger = logging.getLogger(__name__)
 
 
+def _is_empty_search(result: str | None) -> bool:
+    """Check if a JQL search result is empty (no issues found)."""
+    if not result:
+        return True
+    return "Found 0 issues" in result
+
+
+def _parse_review_from_search(result: str, issue_key: str) -> tuple[Optional[str], bool]:
+    """
+    Parse search results to find a [PLAN REVIEW] task key and its Done status.
+
+    Returns:
+        (review_key, is_done) — review_key is None if not found
+    """
+    review_key = None
+    is_done = False
+
+    lines = result.splitlines()
+    for i, line in enumerate(lines):
+        key_match = re.search(r"\*\*([A-Z][A-Z0-9]*-\d+)\*\*", line)
+        if key_match:
+            candidate_key = key_match.group(1)
+            if f"[PLAN REVIEW] {issue_key}" in line or "[PLAN REVIEW]" in line or "[REVIEW]" in line:
+                search_block = line
+                if i + 1 < len(lines):
+                    search_block += "\n" + lines[i + 1]
+                status_match = re.search(r"Status:\s*(\w+)", search_block, re.IGNORECASE)
+                if status_match and status_match.group(1).lower() == "done":
+                    return candidate_key, True
+                elif not review_key:
+                    review_key = candidate_key
+
+    return review_key, is_done
+
+
 def check_review_approved(mcp: MCPClientManager, issue_key: str) -> tuple[bool, Optional[str]]:
     """
-    Check if the [REVIEW] task for this feature is Done.
+    Check if the [PLAN REVIEW] task for this feature is Done.
 
-    Searches comments for the review task key, then checks its status.
+    Strategy 1 (primary): Direct REST API issuelinks field — 100% reliable,
+    bypasses JQL search index entirely.
+
+    Strategy 2+ (fallback): JQL-based search if direct API fails.
 
     Args:
         mcp: MCP client manager
@@ -32,68 +71,107 @@ def check_review_approved(mcp: MCPClientManager, issue_key: str) -> tuple[bool, 
     Returns:
         Tuple of (is_approved, review_task_key)
     """
-    # Strategy: search for linked review tasks via JQL
-    project_key = issue_key.split("-")[0]
-    jql = (
-        f'project = "{project_key}" AND summary ~ "[REVIEW] {issue_key}" '
-        f'AND issuetype = Story'
-    )
+    project_key = extract_project_key(issue_key)
 
+    # Strategy 1: Direct REST API — read issuelinks field (most reliable)
     try:
-        result = mcp.jira_search_issues(jql, max_results=5)
+        links = mcp.jira_get_issue_links(issue_key)
+        for link in links:
+            summary = link.get("summary", "")
+            if "[PLAN REVIEW]" in summary or "[REVIEW]" in summary:
+                is_done = link.get("status", "").lower() == "done"
+                logger.info(
+                    f"Found review task {link['key']} via direct issuelinks for {issue_key}"
+                )
+                return is_done, link["key"]
     except Exception as e:
-        logger.error(f"Failed to search for review task: {e}")
-        return False, None
+        logger.debug(f"Direct issuelinks lookup failed for {issue_key}: {e}")
 
-    if not result:
-        logger.warning(f"No review task found for {issue_key}")
-        return False, None
+    # Strategy 2 (fallback): JQL summary search
+    strategies: list[tuple[str, str]] = [
+        (
+            "summary",
+            f'project = "{project_key}" AND '
+            f'summary ~ "Approve Architecture" AND '
+            f'summary ~ "{issue_key}" AND '
+            f'issuetype = Story',
+        ),
+        (
+            "blocking link",
+            f'issue in linkedIssues("{issue_key}", "is blocked by") AND '
+            f'summary ~ "Approve Architecture" AND '
+            f'issuetype = Story',
+        ),
+    ]
 
-    # Parse the search result to find review task key and status
-    # Result format from MCP: lines like "- **KEY-123** Summary (Status: Done, Type: Story)"
-    review_key = None
-    is_done = False
-
-    for line in result.splitlines():
-        key_match = re.search(r"\*\*([A-Z]+-\d+)\*\*", line)
-        if key_match:
-            candidate_key = key_match.group(1)
-            # Verify it's a review task
-            if f"[REVIEW] {issue_key}" in line or "[REVIEW]" in line:
-                review_key = candidate_key
-                # Check status
-                status_match = re.search(r"Status:\s*(\w+)", line, re.IGNORECASE)
-                if status_match and status_match.group(1).lower() == "done":
-                    is_done = True
-                break
-
-    if not review_key:
-        # Fallback: get issue details directly and check status
-        # Try to find review key from comments
+    for label, jql in strategies:
         try:
-            comments = mcp.jira_get_comments(issue_key)
-            for line in comments.splitlines():
-                key_match = re.search(r"review task:\s*([A-Z]+-\d+)", line, re.IGNORECASE)
-                if key_match:
-                    review_key = key_match.group(1)
-                    break
-        except Exception:
-            pass
-
-    if review_key and not is_done:
-        # Fetch the review task to check its actual status
-        try:
-            issue_details = mcp.jira_get_issue(review_key)
-            if "Status: Done" in issue_details or "status: Done" in issue_details.lower():
-                is_done = True
+            result = mcp.jira_search_issues(jql, max_results=5)
+            if _is_empty_search(result):
+                continue
+            review_key, is_done = _parse_review_from_search(result, issue_key)
+            if review_key:
+                logger.info(f"Found review task {review_key} via {label} for {issue_key}")
+                if not is_done:
+                    try:
+                        issue_details = mcp.jira_get_issue(review_key)
+                        if "status: done" in issue_details.lower():
+                            is_done = True
+                    except Exception as e:
+                        logger.error(f"Failed to check review task status: {e}")
+                return is_done, review_key
         except Exception as e:
-            logger.error(f"Failed to check review task status: {e}")
+            logger.error(f"Failed search strategy '{label}' for {issue_key}: {e}")
 
-    if not review_key:
-        logger.warning(f"Could not find [REVIEW] task for {issue_key}")
-        return False, None
+    # Strategy 3: for child Stories, find parent Feature via direct API
+    # and look up its review task
+    try:
+        links = mcp.jira_get_issue_links(issue_key)
+        parent_keys = [
+            link["key"] for link in links
+            # No reliable way to filter by type from issuelinks alone,
+            # so we'll check each linked issue
+        ]
+        for pk in parent_keys:
+            try:
+                pk_links = mcp.jira_get_issue_links(pk)
+                for pk_link in pk_links:
+                    summary = pk_link.get("summary", "")
+                    if "[PLAN REVIEW]" in summary or "[REVIEW]" in summary:
+                        is_done = pk_link.get("status", "").lower() == "done"
+                        logger.info(
+                            f"Found review task {pk_link['key']} via parent "
+                            f"Feature {pk} for {issue_key}"
+                        )
+                        return is_done, pk_link["key"]
+            except Exception:
+                continue
+    except Exception as e:
+        logger.error(f"Failed parent Feature lookup for {issue_key}: {e}")
 
-    return is_done, review_key
+    # Fallback: search comments for explicit "review task: KEY" reference
+    try:
+        comments = mcp.jira_get_comments(issue_key)
+        for line in comments.splitlines():
+            key_match = re.search(
+                r"review task:\s*([A-Z][A-Z0-9]*-\d+)", line, re.IGNORECASE
+            )
+            if key_match:
+                review_key = key_match.group(1)
+                logger.info(f"Found review task {review_key} via comments for {issue_key}")
+                is_done = False
+                try:
+                    issue_details = mcp.jira_get_issue(review_key)
+                    if "status: done" in issue_details.lower():
+                        is_done = True
+                except Exception:
+                    pass
+                return is_done, review_key
+    except Exception:
+        pass
+
+    logger.warning(f"Could not find [PLAN REVIEW] task for {issue_key}")
+    return False, None
 
 
 def extract_stories_from_comment(mcp: MCPClientManager, issue_key: str) -> list[DecomposedStory]:
@@ -237,6 +315,34 @@ def build_story_description(story: DecomposedStory) -> str:
     return "\n".join(lines)
 
 
+def ensure_review_blocking_link(
+    mcp: MCPClientManager,
+    review_key: str,
+    feature_key: str,
+    config: dict,
+) -> bool:
+    """
+    Ensure the blocking link exists: Feature IS_BLOCKED_BY Review story.
+
+    Jira ignores duplicate links, so this is safe to call unconditionally.
+
+    Returns:
+        True if link was created/verified, False on failure
+    """
+    blocking_link_type = get_blocking_link_type(config)
+    try:
+        mcp.jira_link_issues(
+            from_key=feature_key,
+            to_key=review_key,
+            link_type=blocking_link_type,
+        )
+        logger.info(f"Blocking link ensured: {feature_key} is blocked by {review_key}")
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to ensure blocking link {feature_key} -> {review_key}: {e}")
+        return False
+
+
 def create_jira_stories(
     mcp: MCPClientManager,
     parent_key: str,
@@ -281,7 +387,7 @@ def create_jira_stories(
             )
 
             # Parse key from result
-            key_match = re.search(r"([A-Z]+-\d+)", result)
+            key_match = re.search(r"([A-Z][A-Z0-9]*-\d+)", result)
             if not key_match:
                 logger.error(f"Could not parse issue key from: {result}")
                 continue
@@ -329,9 +435,7 @@ def create_dependency_links(
     """
     # Build order -> key mapping
     order_to_key = {story.order: key for story, key in created_stories}
-    blocking_link_type = "Blocks"
-    if config:
-        blocking_link_type = config.get("jira", {}).get("blocking_link_type", "Blocks")
+    blocking_link_type = get_blocking_link_type(config)
 
     links_created = 0
     for story, story_key in created_stories:
@@ -346,13 +450,15 @@ def create_dependency_links(
 
             try:
                 mcp.jira_link_issues(
-                    from_key=dep_key,
-                    to_key=story_key,
+                    from_key=story_key,
+                    to_key=dep_key,
                     link_type=blocking_link_type,
                 )
-                logger.info(f"Created dependency link: {dep_key} blocks {story_key}")
+                logger.info(f"Created dependency link: {story_key} is blocked by {dep_key}")
                 links_created += 1
             except Exception as e:
-                logger.warning(f"Failed to create dependency link {dep_key} -> {story_key}: {e}")
+                logger.warning(
+                    f"Failed to create dependency link {story_key} -> {dep_key}: {e}"
+                )
 
     return links_created

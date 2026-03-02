@@ -9,10 +9,9 @@ import re
 import logging
 from dataclasses import dataclass, field
 
-logger = logging.getLogger(__name__)
+from ..constants import VALID_LAYERS
 
-# Valid layer codes for Work Plan steps
-VALID_LAYERS = {"BE", "FE", "INFRA", "DB", "QA", "DOCS", "GEN"}
+logger = logging.getLogger(__name__)
 
 # Validation thresholds
 MIN_WORK_PLAN_LENGTH = 50  # Minimum characters for valid Work Plan

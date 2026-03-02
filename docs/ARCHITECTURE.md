@@ -7,7 +7,7 @@ CLI Input → Stage 1 (Trigger) → Stage 2 (Jira Enrichment) → Stage 3a/3b/3c
 ```
 
 - **Stage 1 - Trigger**: Parses and validates issue key from CLI input
-- **Stage 1.5 - Status Gate**: Fetches issue status; Backlog → auto-routes to Phase 0, "AI To Do" → continues full pipeline, other statuses → proceeds with warning
+- **Stage 1.5 - Status Gate**: Fetches issue status; Backlog → auto-routes to Phase 0, "AI To Do" + all artifacts exist → routes to status checklist (pre-flight fulfillment, bypass with `--force`), "AI To Do" → continues full pipeline, other statuses → proceeds with warning
 - **Stage 2 - Jira Enrichment**: Fetches issue details into `JiraContext` (summary, description, fields, comments, assignee accountId)
 - **Stage 3a - Confluence Knowledge**: Two-Stage Retrieval — fetches mandatory core documents (Project Passport, Logical Architecture), then LLM-filters supporting documents via DeepSeek
 - **Stage 3b - GitHub Context**: Fetches repo structure, configs, recent commits, open PRs into `GitHubContext`

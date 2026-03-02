@@ -11,15 +11,13 @@ Stage 5: LLM Execution → uses ExecutionContext.prompt_context
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional, Union, TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING
 from enum import Enum
 
 if TYPE_CHECKING:
     from .github_models import GitHubContext  # noqa: F401
 
-# Content budget defaults (chars) for Confluence document truncation
-CORE_DOC_MAX_CHARS = 12000
-SUPPORTING_DOC_MAX_CHARS = 6000
+from ..constants import CORE_DOC_MAX_CHARS, SUPPORTING_DOC_MAX_CHARS
 
 
 def _truncate_document(content: str, max_chars: int, url: str = "") -> str:

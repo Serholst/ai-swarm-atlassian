@@ -147,5 +147,8 @@ class JiraIssue(BaseModel):
         return self.issue_type.name == "Task"
 
     def is_review_task(self) -> bool:
-        """Check if this is a [REVIEW] task."""
-        return self.is_task() and self.summary.startswith("[REVIEW]")
+        """Check if this is a [PLAN REVIEW] task."""
+        return self.is_task() and (
+            self.summary.startswith("[PLAN REVIEW]")
+            or self.summary.startswith("[REVIEW]")
+        )

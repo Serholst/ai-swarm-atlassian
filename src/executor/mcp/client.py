@@ -425,11 +425,35 @@ class MCPClientManager:
 
         Returns:
             Result message
+
+        Raises:
+            RuntimeError: If the Jira API rejects the link (e.g. unknown link type)
         """
-        return self.clients["jira"].call_tool(
+        result = self.clients["jira"].call_tool(
             "jira_link_issues",
             {"from_key": from_key, "to_key": to_key, "link_type": link_type}
         )
+        if isinstance(result, str) and result.startswith("Error:"):
+            raise RuntimeError(f"Jira link failed [{link_type}] {from_key}->{to_key}: {result}")
+        return result
+
+    def jira_get_link_types(self) -> str:
+        """Return all available Jira issue link type names for this instance."""
+        return self.clients["jira"].call_tool("jira_get_link_types", {})
+
+    def jira_get_issue_links(self, issue_key: str) -> list[dict]:
+        """Get linked issues directly from the issue's issuelinks field.
+
+        Bypasses JQL search index — 100% reliable for finding linked issues.
+
+        Returns:
+            List of dicts with keys: key, summary, status, link_type, direction.
+        """
+        import json
+        raw = self.clients["jira"].call_tool("jira_get_issue_links", {"issue_key": issue_key})
+        if not raw:
+            return []
+        return json.loads(raw)
 
     def confluence_get_page(
         self, page_id: str | None = None, space_key: str | None = None, title: str | None = None

@@ -59,3 +59,26 @@ mypy src/
 - Never read files in `outputs/` directly — they are generated artifacts. Use limit/offset if needed
 - Prefer Glob/Grep over Bash for file search — dedicated tools produce leaner output
 - When running tests, use `pytest <specific_file>` not `pytest` on the full suite unless asked
+
+## Hook-Driven Optimization Protocols
+
+Six hooks in `.claude/hooks/` enforce token efficiency automatically:
+
+**PreToolUse pipeline** (Read): `gate_read` → `diff_focus` → `exploration_guard`
+
+- `gate_read`: blocks reads of `/outputs/` files >15KB
+- `diff_focus`: for large files (>8KB), provides git diff or structural skeleton — use offset/limit to read only the relevant section
+- `exploration_guard`: after 5+ distinct file reads, nudges toward Task subagents
+
+**PostToolUse pipeline** (Read|Grep|Glob|Bash): `output_compressor` → `prompt_budget` → `context_monitor`
+
+- `output_compressor`: flags repetitive patterns in tool output — use head_limit or narrower queries next
+- `prompt_budget`: tiered mode shifts — yellow (40K chars): targeted reads, red (70K): subagent-only, critical (100K): /compact
+- `context_monitor`: warns at 80K chars cumulative
+
+**Behavioral rules enforced by hooks:**
+
+- When `diff_focus` provides a skeleton, read only the line ranges you need — do not re-read the full file
+- When `prompt_budget` enters red tier, delegate ALL exploration to Task subagents
+- When `output_compressor` flags repetition, tighten your next query with head_limit or a narrower glob/pattern
+- For tasks touching 3+ files, use multi-pass: scout with Task(model=haiku) → plan with Task(model=sonnet) → execute edits in main context

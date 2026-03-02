@@ -14,6 +14,7 @@ import re
 import logging
 from typing import Optional
 
+from ..constants import VALID_LAYERS, get_blocking_link_type
 from ..mcp.client import MCPClientManager
 from ..models.execution_context import ExecutionContext
 from ..models.decomposition import (
@@ -25,9 +26,6 @@ from ..mcp.servers.jira_server import MarkdownToADF
 from .llm_executor import LLMResponse
 
 logger = logging.getLogger(__name__)
-
-# Valid layers from SDLC taxonomy
-VALID_LAYERS = {"BE", "FE", "INFRA", "DB", "QA", "DOCS", "GEN"}
 
 
 def _truncate_on_boundary(text: str, max_chars: int = 1500) -> str:
@@ -321,7 +319,7 @@ def create_blocking_review_task(
     """
     Create blocking review Story.
 
-    Creates: [REVIEW] {Issue_Key} Approve Architecture (HUMAN)
+    Creates: [PLAN REVIEW] {Issue_Key} Approve Architecture (HUMAN)
     Links: "Blocks" link to the original issue
 
     Args:
@@ -333,7 +331,21 @@ def create_blocking_review_task(
     Returns:
         Created issue key, or None on failure
     """
-    summary = f"[REVIEW] {issue_key} Approve Architecture (HUMAN)"
+    # Guard: check linked issues for existing PLAN REVIEW before creating
+    # Uses direct REST API (issuelinks field) — does not depend on JQL search index
+    try:
+        links = mcp.jira_get_issue_links(issue_key)
+        for link in links:
+            summary = link.get("summary", "")
+            if "[PLAN REVIEW]" in summary or "[REVIEW]" in summary:
+                logger.info(
+                    f"PLAN REVIEW already exists: {link['key']} — skipping creation"
+                )
+                return link["key"]
+    except Exception as e:
+        logger.debug(f"Linked-issues guard check failed: {e}")
+
+    summary = f"[PLAN REVIEW] {issue_key} Approve Architecture (HUMAN)"
 
     description = f"""Human review required before proceeding to development.
 
@@ -359,7 +371,7 @@ This blocking Story must be marked as **Done** before the feature can progress.
 
         review_key = None
         if isinstance(result, str):
-            key_match = re.search(r"([A-Z]+-\d+)", result)
+            key_match = re.search(r"([A-Z][A-Z0-9]*-\d+)", result)
             if key_match:
                 review_key = key_match.group(1)
 
@@ -370,22 +382,19 @@ This blocking Story must be marked as **Done** before the feature can progress.
         logger.info(f"Created review Story: {review_key}")
 
         # Link review Story to block the original issue
-        blocking_link_type = "Blocks"
-        if config:
-            blocking_link_type = config.get("jira", {}).get(
-                "blocking_link_type", "Blocks"
-            )
+        # Direction: issue IS_BLOCKED_BY review
+        blocking_link_type = get_blocking_link_type(config)
         try:
             mcp.jira_link_issues(
-                from_key=review_key,
-                to_key=issue_key,
+                from_key=issue_key,
+                to_key=review_key,
                 link_type=blocking_link_type,
             )
-            logger.info(f"Created blocking link: {review_key} blocks {issue_key}")
+            logger.info(f"Created blocking link: {issue_key} is blocked by {review_key}")
         except Exception as e:
             logger.error(
                 f"Failed to create blocking link ({blocking_link_type}): "
-                f"{review_key} -> {issue_key}: {e}"
+                f"{issue_key} -> {review_key}: {e}"
             )
 
         return review_key
@@ -647,19 +656,27 @@ def handle_analysis_decomposition(
 
     project_key = execution_context.jira.project_key
 
-    # Create blocking review task
-    review_task_key = create_blocking_review_task(
-        mcp=mcp,
-        project_key=project_key,
-        issue_key=issue_key,
-        config=config,
-    )
-    result.review_task_key = review_task_key
+    # Create blocking review task (idempotent — skip if one already exists)
+    from .story_creator import check_review_approved, ensure_review_blocking_link
 
-    if review_task_key:
-        logger.info(f"Created review task: {review_task_key}")
+    existing_done, existing_key = check_review_approved(mcp, issue_key)
+    if existing_key:
+        logger.info(f"Review task already exists: {existing_key} (skipping creation)")
+        review_task_key = existing_key
+        # Verify blocking link exists (may be missing if previous link creation failed)
+        ensure_review_blocking_link(mcp, existing_key, issue_key, config)
     else:
-        logger.warning("Failed to create review task")
+        review_task_key = create_blocking_review_task(
+            mcp=mcp,
+            project_key=project_key,
+            issue_key=issue_key,
+            config=config,
+        )
+        if review_task_key:
+            logger.info(f"Created review task: {review_task_key}")
+        else:
+            logger.warning("Failed to create review task")
+    result.review_task_key = review_task_key
 
     logger.info(f"Analysis & Decomposition complete for {issue_key}")
     return result

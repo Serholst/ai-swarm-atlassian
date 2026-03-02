@@ -90,6 +90,8 @@ from .phase_zero import (
     PhaseZeroResult,
 )
 
+from .status_checker import run_status_check, check_ready_for_dev_promotion, preflight_check
+
 __all__ = [
     # Stage 1
     "parse_issue_key",
@@ -152,4 +154,8 @@ __all__ = [
     "has_existing_phase0_analysis",
     "extract_assignee_feedback",
     "find_phase0_questions_timestamp",
+    # Status Checker
+    "run_status_check",
+    "check_ready_for_dev_promotion",
+    "preflight_check",
 ]

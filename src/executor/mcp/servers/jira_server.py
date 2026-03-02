@@ -546,7 +546,45 @@ class JiraAPIClient:
             "inwardIssue": {"key": to_key},
             "outwardIssue": {"key": from_key},
         }
-        self._request("POST", url, json=payload)
+        try:
+            self._request("POST", url, json=payload)
+        except requests.exceptions.HTTPError as e:
+            body = e.response.text if e.response is not None else "no body"
+            logger.error(
+                f"link_issues failed [{link_type}] {from_key}->{to_key}: {e} | Jira response: {body}"
+            )
+            raise
+
+    def get_issue_links(self, issue_key: str) -> list[dict]:
+        """Get linked issues directly from the issue's issuelinks field.
+
+        Returns a list of dicts with keys: key, summary, status, link_type, direction.
+        This is more reliable than JQL linkedIssues() which depends on search indexing.
+        """
+        url = f"{self.base_url}/rest/api/3/issue/{issue_key}"
+        params = {"fields": "issuelinks"}
+        data = self._request("GET", url, params=params).json()
+        links = data.get("fields", {}).get("issuelinks", [])
+
+        result = []
+        for link in links:
+            link_type = link.get("type", {}).get("name", "")
+            for direction in ("inwardIssue", "outwardIssue"):
+                linked = link.get(direction)
+                if linked:
+                    result.append({
+                        "key": linked.get("key", ""),
+                        "summary": linked.get("fields", {}).get("summary", ""),
+                        "status": linked.get("fields", {}).get("status", {}).get("name", ""),
+                        "link_type": link_type,
+                        "direction": direction,
+                    })
+        return result
+
+    def get_link_types(self) -> list[dict]:
+        """Return all available issue link types for this Jira instance."""
+        url = f"{self.base_url}/rest/api/3/issueLinkType"
+        return self._request("GET", url).json().get("issueLinkTypes", [])
 
 
 def extract_adf_text(adf: dict) -> str:
@@ -859,6 +897,22 @@ async def list_tools() -> list[Tool]:
                 "required": ["from_key", "to_key"],
             },
         ),
+        Tool(
+            name="jira_get_link_types",
+            description="List all available Jira issue link type names for this instance",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        Tool(
+            name="jira_get_issue_links",
+            description="Get linked issues directly from the issue's issuelinks field (bypasses JQL search index)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "issue_key": {"type": "string", "description": "Issue key (e.g., AI-123)"},
+                },
+                "required": ["issue_key"],
+            },
+        ),
     ]
 
 
@@ -966,6 +1020,20 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
 
             jira_client.link_issues(from_key, to_key, link_type)
             return [TextContent(type="text", text=f"Linked {from_key} -> {to_key} ({link_type})")]
+
+        elif name == "jira_get_link_types":
+            types = jira_client.get_link_types()
+            lines = [
+                f"{t['name']} (inward: \"{t['inward']}\", outward: \"{t['outward']}\")"
+                for t in types
+            ]
+            return [TextContent(type="text", text="\n".join(lines) if lines else "No link types found")]
+
+        elif name == "jira_get_issue_links":
+            issue_key = arguments["issue_key"]
+            links = jira_client.get_issue_links(issue_key)
+            import json as _json
+            return [TextContent(type="text", text=_json.dumps(links))]
 
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]

@@ -60,8 +60,8 @@ jira:
 
   # Blocking Task Naming Patterns
   blocking_tasks:
-    architecture_review: "[REVIEW] Approve Architecture (HUMAN)"
-    code_review_pattern: "[REVIEW] Code Review (Iter {iteration})"
+    architecture_review: "[PLAN REVIEW] Approve Architecture (HUMAN)"
+    code_review_pattern: "[PLAN REVIEW] Code Review (Iter {iteration})"
 
   # Custom Field Mapping (instance-specific)
   # Find your field IDs: https://your-domain.atlassian.net/rest/api/3/field
@@ -129,7 +129,7 @@ naming:
   # Patterns
   feature_title: "[{project_name}] {description}"
   story_title: "[{layer}] {action}"
-  review_task: "[REVIEW] {phase_name} (HUMAN)"
+  review_task: "[PLAN REVIEW] {phase_name} (HUMAN)"
   draft_comment_header: "### DRAFT: {issue_key}_{slug}_{artifact_type}.md"
 
 # Operational Mode
@@ -149,7 +149,7 @@ gates:
 
   architecture_gate:
     - "Plan fixed in Jira Comment"
-    - "[REVIEW] Approve Architecture marked as Done"
+    - "[PLAN REVIEW] Approve Architecture marked as Done"
 
   definition_of_done:
     - "SSOT: Confluence matches implementation"

@@ -996,13 +996,19 @@ def execute_phase_zero_feedback(
 
     if dor_met:
         logger.info("Phase 0.5: DoR MET — all blocking questions resolved")
-        # Transition to AI To Do if not dry-run
+        # Transition to AI-TO-DO if not dry-run
+        ai_todo_status = (config or {}).get("jira", {}).get("statuses", {}).get(
+            "ai_to_do", "AI-TO-DO"
+        )
         if not dry_run:
             try:
-                mcp.jira_transition_issue(issue_key, "AI To Do")
-                logger.info(f"Phase 0.5: Transitioned {issue_key} to 'AI To Do'")
+                result = mcp.jira_transition_issue(issue_key, ai_todo_status)
+                if result and result.startswith("Error:"):
+                    logger.warning(f"Phase 0.5: Transition failed: {result}")
+                else:
+                    logger.info(f"Phase 0.5: Transitioned {issue_key} to '{ai_todo_status}'")
             except Exception as e:
-                logger.warning(f"Phase 0.5: Transition to 'AI To Do' failed: {e}")
+                logger.warning(f"Phase 0.5: Transition to '{ai_todo_status}' failed: {e}")
     else:
         logger.info("Phase 0.5: DoR NOT MET — unresolved blocking questions remain")
 

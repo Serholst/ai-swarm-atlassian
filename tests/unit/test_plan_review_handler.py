@@ -43,8 +43,8 @@ CONFIG = {
 SC = "executor.phases.story_creator"
 
 
-@patch("execute.get_issue_status", return_value="Ready for Dev")
-@patch("execute.extract_project_key", return_value="PROJ")
+@patch("executor.phases.review_handler.get_issue_status", return_value="Ready for Dev")
+@patch("executor.phases.review_handler.extract_project_key", return_value="PROJ")
 class TestHumanPlanReviewHandler:
     """Tests for human_plan_review_handler."""
 
@@ -64,7 +64,7 @@ class TestHumanPlanReviewHandler:
         mock_status,
     ):
         """When [PLAN REVIEW] is Done, stories are created and issue transitions."""
-        from execute import human_plan_review_handler
+        from executor.phases.review_handler import human_plan_review_handler
 
         stories = [_make_story(1), _make_story(2)]
         mock_extract.return_value = stories
@@ -90,7 +90,7 @@ class TestHumanPlanReviewHandler:
         mock_status,
     ):
         """When [PLAN REVIEW] is not Done, exit 0 with info message."""
-        from execute import human_plan_review_handler
+        from executor.phases.review_handler import human_plan_review_handler
 
         mcp = _mock_mcp()
         result = human_plan_review_handler(mcp, "PROJ-10", CONFIG)
@@ -107,7 +107,7 @@ class TestHumanPlanReviewHandler:
         mock_status,
     ):
         """When no [PLAN REVIEW] task found, exit 1."""
-        from execute import human_plan_review_handler
+        from executor.phases.review_handler import human_plan_review_handler
 
         mcp = _mock_mcp()
         result = human_plan_review_handler(mcp, "PROJ-10", CONFIG)
@@ -131,7 +131,7 @@ class TestHumanPlanReviewHandler:
         mock_status,
     ):
         """Partial story failure returns exit 2, no transition."""
-        from execute import human_plan_review_handler
+        from executor.phases.review_handler import human_plan_review_handler
 
         stories = [_make_story(1), _make_story(2)]
         mock_extract.return_value = stories
@@ -164,7 +164,7 @@ class TestHumanPlanReviewHandler:
         mock_status,
     ):
         """All stories already exist (skipped) — still transitions to Ready for Dev."""
-        from execute import human_plan_review_handler
+        from executor.phases.review_handler import human_plan_review_handler
 
         stories = [_make_story(1), _make_story(2)]
         mock_extract.return_value = stories
@@ -197,7 +197,7 @@ class TestHumanPlanReviewHandler:
         mock_status,
     ):
         """All stories failed returns exit 1."""
-        from execute import human_plan_review_handler
+        from executor.phases.review_handler import human_plan_review_handler
 
         stories = [_make_story(1), _make_story(2)]
         mock_extract.return_value = stories

@@ -43,23 +43,34 @@ CLI Input → Stage 1 (Trigger) → Stage 2 (Jira Enrichment) → Stage 3a/3b/3c
 | `src/executor/phases/phase_zero.py` | Phase 0 (Backlog Analysis) and Phase 0.5 (Feedback Incorporation) |
 | `src/executor/phases/story_creator.py` | Auto-create Jira child stories from decomposition |
 | `src/executor/phases/context_store.py` | Serialize/deserialize ExecutionContext for `--refine` mode |
+| `src/executor/phases/review_handler.py` | Human Plan Review handler (story creation + transition) |
 | `src/executor/mcp/client.py` | MCP client manager — lifecycle for Jira, Confluence, GitHub servers |
 | `src/executor/mcp/servers/jira_server.py` | Custom Jira MCP server (ADF→Markdown conversion) |
 | `src/executor/mcp/servers/confluence_server.py` | Custom Confluence MCP server |
+| `src/executor/mcp/pipeline_server.py` | MCP server exposing AI-Swarm pipeline as agent tools |
 | `src/executor/models/execution_context.py` | Core dataclasses: `ExecutionContext`, `JiraContext`, `GitHubContext`, `RefinedConfluenceContext` |
 | `src/executor/prompts/system_prompt.py` | System prompt construction for DeepSeek |
 | `src/executor/prompts/user_prompt.py` | User prompt construction with context injection |
 | `src/executor/prompts/phase_zero_prompt.py` | Phase 0 prompt templates (Backlog Analysis) |
 | `src/executor/prompts/phase_zero_feedback_prompt.py` | Phase 0.5 prompt templates (Feedback Incorporation) |
 | `src/executor/prompts/template_compliance.py` | Shared helper for template compliance prompt sections |
-| `execute.py` | CLI entry point (argparse-based) |
+| `src/executor/cli/main.py` | CLI entry point (argparse + dispatch) |
+| `src/executor/cli/pipeline_cmd.py` | Full 5-stage pipeline command |
+| `src/executor/cli/phase_zero_cmd.py` | Phase 0 pipeline command |
+| `src/executor/cli/refine_cmd.py` | Refinement pipeline command |
+| `src/executor/cli/shared.py` | Shared CLI state: console, load_environment |
+| `execute.py` | Thin wrapper → `executor.cli.main` (backwards compat) |
 
 ### MCP Integration
 
-Three MCP servers managed by `MCPClientManager`:
+Three MCP servers consumed by `MCPClientManager`:
 - **Jira** — custom Python server (`jira_server.py`)
 - **Confluence** — custom Python server (`confluence_server.py`)
 - **GitHub** — official `@modelcontextprotocol/server-github` via npx
+
+One MCP server exposed for other agents:
+
+- **Pipeline** — `src/executor/mcp/pipeline_server.py` exposes `run_pipeline`, `run_phase0`, `refine_plan` tools
 
 ### Data Flow
 

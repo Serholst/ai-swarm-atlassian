@@ -17,7 +17,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 # Add src to path
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
 from executor.mcp.client import MCPClientManager
 from executor.utils.config_loader import load_config
@@ -27,7 +27,7 @@ console = Console()
 
 def load_environment() -> dict[str, str]:
     """Load environment variables from .env file."""
-    env_file = Path(__file__).parent.parent / ".env"
+    env_file = Path(__file__).parent.parent.parent / ".env"
 
     if not env_file.exists():
         console.print("[red]Error: .env file not found[/red]")
@@ -273,7 +273,7 @@ def main():
 
     # Load config
     console.print("\n[bold]Step 2: Loading Configuration...[/bold]")
-    config_path = Path(__file__).parent.parent / "config" / "sdlc_config.yaml"
+    config_path = Path(__file__).parent.parent.parent / "config" / "sdlc_config.yaml"
     config = load_config(config_path)
     console.print(f"[green]✓ Configuration loaded from {config_path}[/green]")
 

@@ -31,7 +31,7 @@ python execute.py --refine PROJ-123 --feedback "Split step 3 into BE and FE"
 pytest tests/unit/                          # unit tests only
 pytest tests/unit/test_validation.py        # single test file
 ./run_tests.sh                              # MCP integration tests (requires .env credentials)
-python tests/test_mcp_integration.py        # MCP integration tests directly
+python tests/integration/test_mcp_integration.py  # MCP integration tests directly
 
 # Code quality
 black --line-length 100 src/

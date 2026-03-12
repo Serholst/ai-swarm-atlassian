@@ -25,7 +25,7 @@ pip install -r requirements.txt
 Or use the setup script:
 
 ```bash
-./setup.sh
+./scripts/setup.sh
 ```
 
 ## Step 2: Configure Credentials
@@ -67,7 +67,7 @@ Edit `config/sdlc_config.yaml` to match your setup:
 ./run_tests.sh
 
 # Or manually
-python tests/test_mcp_integration.py
+python tests/integration/test_mcp_integration.py
 ```
 
 Expected output:

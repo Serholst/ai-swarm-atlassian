@@ -1,0 +1,61 @@
+# AI-Swarm
+
+> Multi-agent SDLC orchestrator: transforms Jira issues into detailed work plans via a 5-stage pipeline.
+> Integrates with Atlassian (Jira/Confluence) and GitHub via MCP servers. LLM: DeepSeek.
+
+## Docs
+
+- [Architecture](docs/ARCHITECTURE.md)
+- [Quickstart](QUICKSTART.md)
+- [Agent instructions](AGENTS.md)
+- [Config reference](config/sdlc_config.example.yaml)
+- [Environment template](.env.example)
+
+## Entry Points
+
+```bash
+python execute.py --task PROJ-123                        # Full 5-stage pipeline
+python execute.py --task PROJ-123 --output-format json   # Machine-readable output
+python execute.py --phase0 PROJ-123                      # Phase 0: Backlog Analysis
+python execute.py --refine PROJ-123 --feedback "..."     # Refine with feedback
+python src/executor/mcp/pipeline_server.py               # Expose pipeline as MCP server
+```
+
+## MCP Server (agent-to-agent)
+
+Start: `python src/executor/mcp/pipeline_server.py`
+
+Tools:
+- `run_pipeline(issue_key, dry_run?)` — Full pipeline → Work Plan JSON
+- `run_phase0(issue_key, dry_run?)` — Backlog Analysis → Use Cases + DoR
+- `refine_plan(issue_key, feedback)` — Refine plan with human feedback
+
+## Pipeline Stages
+
+1. Trigger — parse Jira issue key
+2. Jira Enrichment — fetch issue details, comments, assignee
+3. Confluence + GitHub + Templates — project knowledge retrieval
+4. Data Aggregation — unified ExecutionContext
+5. LLM Execution — DeepSeek generates work plan
+
+## Output
+
+Files in `outputs/{ISSUE_KEY}/`:
+- `{KEY}_work_plan.md` — generated work plan
+- `{KEY}_pipeline_metrics.json` — structured metrics with trace_id
+- `{KEY}_context_store.json` — serialized context for refinement
+
+## Key Source Files
+
+- `execute.py` — CLI entry point
+- `src/executor/mcp/pipeline_server.py` — MCP server (pipeline as tools)
+- `src/executor/phases/context_builder.py` — Stages 1–4
+- `src/executor/phases/llm_executor.py` — Stage 5 (LLM)
+- `src/executor/phases/phase_zero.py` — Phase 0 and 0.5
+- `src/executor/models/execution_context.py` — core data models
+- `src/executor/mcp/client.py` — MCP client manager
+
+## Configuration
+
+- `.env` — credentials (Atlassian, DeepSeek, GitHub)
+- `config/sdlc_config.yaml` — workflow config (Jira statuses, LLM params, layer taxonomy)

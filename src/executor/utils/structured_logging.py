@@ -3,11 +3,38 @@ Structured logging configuration.
 
 Provides JSON-formatted logging for CI/automation environments
 and keeps the default rich-console-friendly format for interactive use.
+
+Usage:
+    from executor.utils.structured_logging import setup_structured_logging, new_trace_id, set_trace_id
+
+    trace_id = new_trace_id()          # Generate a new trace ID for a pipeline run
+    set_trace_id(trace_id)             # Attach to all subsequent log records
+    logger.info("Stage started", extra={"stage": "context_building", "issue_key": "PROJ-123"})
 """
 
 import json
 import logging
+import uuid
+from contextvars import ContextVar
 from datetime import datetime, timezone
+
+# Thread/async-safe trace ID storage
+_trace_id_var: ContextVar[str] = ContextVar("trace_id", default="")
+
+
+def new_trace_id() -> str:
+    """Generate a new unique trace ID for a pipeline run."""
+    return uuid.uuid4().hex[:12]
+
+
+def set_trace_id(trace_id: str) -> None:
+    """Attach a trace ID to the current execution context."""
+    _trace_id_var.set(trace_id)
+
+
+def get_trace_id() -> str:
+    """Return the current trace ID (empty string if not set)."""
+    return _trace_id_var.get()
 
 
 class StructuredFormatter(logging.Formatter):
@@ -22,6 +49,11 @@ class StructuredFormatter(logging.Formatter):
             "module": record.module,
             "function": record.funcName,
         }
+
+        # Attach trace ID if present
+        trace_id = _trace_id_var.get()
+        if trace_id:
+            log_entry["trace_id"] = trace_id
 
         # Add extra fields if present (set via logger.info("msg", extra={...}))
         for key in ("issue_key", "stage", "duration_ms", "tokens", "step"):
